@@ -144,3 +144,8 @@ docs: clarify setup steps for Codex CLI users
 ## Reporting issues
 
 Use the GitHub issue templates for bug reports and feature requests, including reproduction steps and expected behavior.
+
+<!-- v3-ai-sdlc-init:start -->
+## v3
+This repo follows the v3 AI-SDLC layout. See `.ai/matrix.json` and `AGENTS.md` for the operating contract.
+<!-- v3-ai-sdlc-init:end -->
