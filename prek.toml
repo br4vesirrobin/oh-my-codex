@@ -13,10 +13,8 @@ hooks = [
   { id = "trailing-whitespace", pass_filenames = false },
 ]
 
-[[repos]]
-repo = "https://github.com/doublify/pre-commit-rust"
-rev = "v1.0"
-hooks = [
-  { id = "cargo-fmt", pass_filenames = false },
-  { id = "cargo-clippy", args = ["--all-targets", "--", "-D", "warnings"], pass_filenames = false },
-]
+# Rust formatting and clippy are run separately by .github/workflows/ci.yml
+# (Rust Format / Rust Clippy lanes) which install the toolchain via
+# dtolnay/rust-toolchain and run cargo fmt --check / cargo clippy directly.
+# The doublify/pre-commit-rust mirror is archived and its hook IDs are gone,
+# so it is intentionally not used here.
