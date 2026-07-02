@@ -79,7 +79,6 @@ import {
 } from "./codex-home.js";
 import { discoverProjectRuntimeCodexHomes } from "./project-runtime-codex-homes.js";
 import {
-  discoverOmxPluginCacheDirs,
   materializePackagedOmxPluginCache,
   packagedOmxPluginVersion,
   resolvePackagedOmxMarketplace,
@@ -1161,33 +1160,25 @@ export interface ResumePluginPreflightResult {
   configUpdated: boolean;
 }
 
+
 export async function preflightResumeOmxPluginState(
   codexHomeDir: string | undefined,
   pkgRoot = getPackageRoot(),
 ): Promise<ResumePluginPreflightResult> {
-  if (!codexHomeDir) {
-    return { status: "unavailable", prunedStaleDirs: [], configUpdated: false };
-  }
-
+  const selectedCodexHomeDir = codexHomeDir && codexHomeDir.trim() !== ""
+    ? codexHomeDir
+    : join(homedir(), ".codex");
   const packagedMarketplace = await resolvePackagedOmxMarketplace(pkgRoot);
   if (!packagedMarketplace) {
     return { status: "unavailable", prunedStaleDirs: [], configUpdated: false };
   }
 
-  const materialized = await materializePackagedOmxPluginCache(codexHomeDir, packagedMarketplace);
+  const materialized = await materializePackagedOmxPluginCache(selectedCodexHomeDir, packagedMarketplace);
   const version = materialized.version ?? (await packagedOmxPluginVersion(packagedMarketplace)) ?? undefined;
-  const currentCacheDir = materialized.cacheDir ?? (version ? join(codexHomeDir, "plugins", "cache", "oh-my-codex-local", "oh-my-codex", version) : undefined);
+  const currentCacheDir = materialized.cacheDir ?? (version ? join(selectedCodexHomeDir, "plugins", "cache", "oh-my-codex-local", "oh-my-codex", version) : undefined);
   const prunedStaleDirs: string[] = [];
 
-  if (currentCacheDir) {
-    for (const cacheDir of await discoverOmxPluginCacheDirs(codexHomeDir)) {
-      if (cacheDir === currentCacheDir) continue;
-      await rm(cacheDir, { recursive: true, force: true });
-      prunedStaleDirs.push(cacheDir);
-    }
-  }
-
-  const configPath = join(codexHomeDir, "config.toml");
+  const configPath = join(selectedCodexHomeDir, "config.toml");
   const existingConfig = existsSync(configPath) ? await readFile(configPath, "utf-8") : "";
   const nextConfig = upsertLocalOmxMarketplaceRegistration(
     upsertLocalOmxPluginEnablement(existingConfig),
