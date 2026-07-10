@@ -1,5 +1,7 @@
 import { AGENT_DEFINITIONS } from '../agents/definitions.js';
 import {
+  DEFAULT_SPARK_MODEL,
+  DEFAULT_STANDARD_MODEL,
   getAgentModelOverride,
   getMainDefaultModel,
   getModelForMode,
@@ -24,6 +26,7 @@ function normalizeModelName(value: string): string {
 export function isCheapOrMiniModelName(model: string): boolean {
   const normalized = normalizeModelName(model);
   if (!normalized) return false;
+  if (normalized === DEFAULT_STANDARD_MODEL || normalized === DEFAULT_SPARK_MODEL) return true;
   return CHEAP_OR_MINI_MODEL_PATTERN.test(normalized);
 }
 

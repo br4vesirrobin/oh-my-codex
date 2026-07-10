@@ -160,6 +160,37 @@ describe("agents/native-config", () => {
     }
   });
 
+  it("applies Terra guidance when agentModels resolves exact-Sol roles to gpt-5.6-terra", async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-terra-override-"));
+    try {
+      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
+        agentModels: {
+          planner: "gpt-5.6-terra",
+          architect: "gpt-5.6-terra",
+        },
+      }));
+
+      for (const role of ["planner", "architect"] as const) {
+        const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`, {
+          codexHomeOverride: codexHome,
+        });
+        assert.match(toml, /model = "gpt-5\.6-terra"/);
+        assert.match(toml, /exact gpt-5\.6-terra model/);
+      }
+
+      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
+        agentModels: { planner: "gpt-5.6-terra-tuned" },
+      }));
+      const tunedToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.match(tunedToml, /model = "gpt-5\.6-terra-tuned"/);
+      assert.doesNotMatch(tunedToml, /exact gpt-5\.6-terra model/);
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
 
   it("pins planner and architect to exact gpt-5.6-sol while keeping researcher on exact Terra", () => {
     process.env.OMX_DEFAULT_FRONTIER_MODEL = "gpt-5.6-sol";

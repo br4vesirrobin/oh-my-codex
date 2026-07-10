@@ -878,6 +878,27 @@ describe("worker bootstrap", () => {
     assert.match(inbox, /missing_delegation_compliance_evidence/);
   });
 
+  it("generateInitialInbox resolves missing child_model through OMX_TEAM_CHILD_MODEL", () => {
+    const previousChildModel = process.env.OMX_TEAM_CHILD_MODEL;
+    process.env.OMX_TEAM_CHILD_MODEL = "team-child-override";
+    try {
+      const tasks: TeamTask[] = [{
+        id: "12",
+        subject: "Delegate bounded research",
+        description: "Inspect independent implementation options",
+        status: "pending",
+        created_at: new Date(0).toISOString(),
+        delegation: { mode: "auto" },
+      }];
+
+      const inbox = generateInitialInbox("worker-1", "team-delegation", "executor", tasks);
+      assert.match(inbox, /Subagent model: team-child-override/);
+    } finally {
+      if (typeof previousChildModel === "string") process.env.OMX_TEAM_CHILD_MODEL = previousChildModel;
+      else delete process.env.OMX_TEAM_CHILD_MODEL;
+    }
+  });
+
   it("generateInitialInbox keeps mode none tasks quiet about delegation contract", () => {
     const tasks: TeamTask[] = [{
       id: "8",

@@ -2558,7 +2558,7 @@ function resolveSparkModelSource(codexHomeOverride?: string): string {
 		return `${OMX_SPARK_MODEL_ENV} env`;
 	}
 	if (getEnvConfiguredSparkDefaultModel(process.env, codexHomeOverride)) {
-		return "config.toml env";
+		return ".omx-config.json env";
 	}
 	return "built-in default";
 }

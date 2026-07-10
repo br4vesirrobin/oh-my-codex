@@ -66,6 +66,16 @@ describe('checkSparkRouting', () => {
     assert.match(result.message, /spark=/);
   });
 
+  it('reports .omx-config.json as the source for its Spark env override', () => {
+    writeFileSync(join(workDir, '.omx-config.json'), JSON.stringify({
+      env: { OMX_DEFAULT_SPARK_MODEL: 'spark-from-omx-config' },
+    }));
+    writeExploreToml('name = "explore"\nmodel = "spark-from-omx-config"\n');
+
+    const result = checkSparkRouting(makePaths(workDir));
+    assert.match(result.message, /source: \.omx-config\.json env/);
+  });
+
   it('warns when the Spark-lane agent toml is missing', () => {
     const result = checkSparkRouting(makePaths(workDir));
     assert.equal(result.status, 'warn');

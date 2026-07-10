@@ -34,11 +34,12 @@ describe('autopilot planner routing', () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  it('classifies cheap and mini model names without matching unrelated words', () => {
-    assert.equal(isCheapOrMiniModelName('o4-mini'), true);
+  it('classifies canonical cheap lanes before generic cheap-or-mini tokens', () => {
+    assert.equal(isCheapOrMiniModelName('gpt-5.6-terra'), true);
     assert.equal(isCheapOrMiniModelName('gpt-5.6-luna'), true);
-    assert.equal(isCheapOrMiniModelName('vendor/cheap-router'), true);
     assert.equal(isCheapOrMiniModelName('gpt-5.6-sol'), false);
+    assert.equal(isCheapOrMiniModelName('o4-mini'), true);
+    assert.equal(isCheapOrMiniModelName('vendor/cheap-router'), true);
     assert.equal(isCheapOrMiniModelName('dominican-router'), false);
   });
 
@@ -64,6 +65,14 @@ describe('autopilot planner routing', () => {
       reason: 'main_is_cheap_or_mini',
       explicitPlannerOverride: false,
     });
+  });
+
+  it('routes Autopilot planning to planner when its model is gpt-5.6-terra', async () => {
+    await writeConfig(tempDir, { models: { autopilot: 'gpt-5.6-terra' } });
+
+    const decision = resolveAutopilotPlannerRouting(tempDir);
+    assert.equal(decision.owner, 'planner');
+    assert.equal(decision.reason, 'main_is_cheap_or_mini');
   });
 
   it('lets agentModels.planner explicitly opt into dedicated planner ownership', async () => {

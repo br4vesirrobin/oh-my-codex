@@ -109,7 +109,7 @@ For `omx sparkshell`, the documented helper-specific environment keys are:
 
 `models` maps mode names to explicit model overrides. Values must be non-empty strings.
 
-Built-in defaults are `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. Legacy aliases include `gpt-5.5`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark`. Model override fields remain non-empty strings so provider-specific model names stay backward-compatible; the known-alias list is used for display and contract tests, not as a closed allow-list.
+Built-in defaults and the complete known-alias list are exactly `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. Prior-generation names such as `gpt-5.5`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark` are accepted only as opaque override strings; they are not known aliases. Model override fields remain non-empty strings so provider-specific model names stay backward-compatible; the known-alias list is used for display and contract tests, not as a closed allow-list.
 
 
 Supported model-routing keys:

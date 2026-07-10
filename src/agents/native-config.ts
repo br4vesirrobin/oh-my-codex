@@ -229,9 +229,11 @@ export function composeRoleInstructions(
     );
   }
 
-  const exactModel = metadata?.exactModel
-    ?? (resolvedModel?.trim() === EXACT_GPT_5_6_TERRA_MODEL ? EXACT_GPT_5_6_TERRA_MODEL : undefined);
-  if (exactModel && resolvedModel?.trim() === exactModel) {
+  const normalizedResolvedModel = resolvedModel?.trim();
+  const exactModel = normalizedResolvedModel === EXACT_GPT_5_6_TERRA_MODEL
+    ? EXACT_GPT_5_6_TERRA_MODEL
+    : metadata?.exactModel;
+  if (exactModel && normalizedResolvedModel === exactModel) {
     parts.push("", buildExactModelOverlay(exactModel));
   }
 
