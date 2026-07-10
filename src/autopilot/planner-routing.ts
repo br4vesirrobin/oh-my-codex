@@ -15,7 +15,7 @@ export interface AutopilotPlannerRoutingDecision {
   explicitPlannerOverride: boolean;
 }
 
-const CHEAP_OR_MINI_MODEL_PATTERN = /(?:^|[-_:/\s])(?:o\d+-mini|mini|nano|small|cheap|economy|spark|lite|flash)(?:$|[-_:/\s])/i;
+const CHEAP_OR_MINI_MODEL_PATTERN = /(?:^|[-_:/\s])(?:o\d+-mini|mini|nano|small|cheap|economy|spark|luna|lite|flash)(?:$|[-_:/\s])/i;
 
 function normalizeModelName(value: string): string {
   return value.trim();

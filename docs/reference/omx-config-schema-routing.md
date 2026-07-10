@@ -57,24 +57,24 @@ The model-routing reader supports `env`, `models`, and the per-role override map
 ```json
 {
   "agentModels": {
-    "planner": "gpt-5.5",
-    "architect": "gpt-5.5",
-    "researcher": "gpt-5.5",
-    "explore": "gpt-5.5"
+    "planner": "gpt-5.6-sol",
+    "architect": "gpt-5.6-sol",
+    "researcher": "gpt-5.6-terra",
+    "explore": "gpt-5.6-luna"
   },
   "agentReasoning": {
     "architect": "xhigh",
     "critic": "xhigh"
   },
   "env": {
-    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.5",
-    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.4-mini",
-    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.3-codex-spark"
+    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.6-sol",
+    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.6-terra",
+    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.6-luna"
   },
   "models": {
-    "default": "gpt-5.5",
-    "team": "gpt-5.5",
-    "team_low_complexity": "gpt-5.3-codex-spark"
+    "default": "gpt-5.6-sol",
+    "team": "gpt-5.6-sol",
+    "team_low_complexity": "gpt-5.6-luna"
   }
 }
 ```
@@ -109,7 +109,7 @@ For `omx sparkshell`, the documented helper-specific environment keys are:
 
 `models` maps mode names to explicit model overrides. Values must be non-empty strings.
 
-Known Codex/OpenAI-compatible model aliases include the built-in `gpt-5.5`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, plus the GPT-5.6 aliases `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.6-sol`. Model override fields remain non-empty strings so provider-specific model names stay backward-compatible; the known-alias list is used for display and contract tests, not as a closed allow-list.
+Built-in defaults are `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. Legacy aliases include `gpt-5.5`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark`. Model override fields remain non-empty strings so provider-specific model names stay backward-compatible; the known-alias list is used for display and contract tests, not as a closed allow-list.
 
 
 Supported model-routing keys:
@@ -131,10 +131,10 @@ Do not invent per-role maps such as `models.executor`, `models.architect`, or `m
 ```json
 {
   "agentModels": {
-    "architect": "gpt-5.5",
-    "planner": "gpt-5.5",
-    "researcher": "gpt-5.5",
-    "explore": "gpt-5.5"
+    "architect": "gpt-5.6-sol",
+    "planner": "gpt-5.6-sol",
+    "researcher": "gpt-5.6-terra",
+    "explore": "gpt-5.6-luna"
   }
 }
 ```
@@ -144,7 +144,7 @@ These overrides do not change built-in defaults in source. They are user/project
 For a named role, effective model precedence is:
 
 1. `.omx-config.json` `agentModels[role]`
-2. Built-in `exactModel` pins, such as planner/architect `gpt-5.5` or researcher `gpt-5.4-mini`
+2. Built-in `exactModel` pins, such as planner/architect `gpt-5.6-sol` or researcher `gpt-5.6-terra`
 3. Special role logic, such as `executor` using the main/frontier lane
 4. `modelClass` routing: `fast` uses spark/low-complexity, `frontier` uses main/frontier, and `standard` uses the standard lane
 
@@ -178,7 +178,7 @@ The main default resolves in this order:
 1. Shell `OMX_DEFAULT_FRONTIER_MODEL`
 2. `.omx-config.json` `env.OMX_DEFAULT_FRONTIER_MODEL`
 3. Active Codex `config.toml` root `model`
-4. Built-in default: `gpt-5.5`
+4. Built-in default: `gpt-5.6-sol`
 
 ### Mode-specific model lookup
 
@@ -188,7 +188,7 @@ When code asks for `getModelForMode(mode)`, the mode model resolves in this orde
 2. `.omx-config.json` `models.default`
 3. Main/frontier default above
 
-Example: with `models.team = "gpt-5.5"` and `models.default = "gpt-5.4-mini"`, `team` uses `gpt-5.5`; a mode without its own key uses `gpt-5.4-mini`.
+Example: with `models.team = "gpt-5.6-sol"` and `models.default = "gpt-5.6-terra"`, `team` uses `gpt-5.6-sol`; a mode without its own key uses `gpt-5.6-terra`.
 
 ### Standard-lane agents
 
@@ -209,7 +209,7 @@ Spark/fast defaults resolve in this order:
 3. `.omx-config.json` `env.OMX_DEFAULT_SPARK_MODEL`
 4. `.omx-config.json` legacy `env.OMX_SPARK_MODEL`
 5. `.omx-config.json` `models.team_low_complexity`, `models.team-low-complexity`, or `models.teamLowComplexity`
-6. Built-in default: `gpt-5.3-codex-spark`
+6. Built-in default: `gpt-5.6-luna`
 
 For team low-complexity helpers, the exact order depends on the call path: `getSparkDefaultModel()` checks spark env/config values before low-complexity aliases, while `getTeamLowComplexityModel()` checks low-complexity aliases before falling back to the spark default.
 
@@ -221,7 +221,7 @@ Examples:
 
 | Role/category | Examples | Model class behavior |
 | --- | --- | --- |
-| Exact planning/research pins | `planner`, `architect`, `researcher` | Uses the built-in `exactModel` pin before model-class routing unless `agentModels[role]` is set; planner uses exact `gpt-5.5` with medium reasoning, architect uses exact `gpt-5.5` with xhigh reasoning, and researcher stays on exact `gpt-5.4-mini`. Ralplan's `critic` remains frontier-routed for the consensus gate. In Autopilot, `planning_routing.owner` switches the initial ralplan Planner draft/decomposition to this dedicated `planner` role when `[main]` is cheap/mini or when `agentModels.planner` is configured. |
+| Exact planning/research pins | `planner`, `architect`, `researcher` | Uses the built-in `exactModel` pin before model-class routing unless `agentModels[role]` is set; planner uses exact `gpt-5.6-sol` with medium reasoning, architect uses exact `gpt-5.6-sol` with xhigh reasoning, and researcher stays on exact `gpt-5.6-terra`. Ralplan's `critic` remains frontier-routed for the consensus gate. In Autopilot, `planning_routing.owner` switches the initial ralplan Planner draft/decomposition to this dedicated `planner` role when `[main]` is cheap/mini or when `agentModels.planner` is configured. |
 | Frontier orchestration | `critic`, `code-reviewer`, `security-reviewer`, `team-executor`, `vision` | Native-agent generation uses active `config.toml` root `model` first, then the main/frontier default fallback. |
 | Standard worker/review | `debugger`, `quality-reviewer`, `api-reviewer`, `performance-reviewer`, `dependency-expert`, `writer` | Uses the standard-lane default, which inherits main/frontier unless `OMX_DEFAULT_STANDARD_MODEL` is set. |
 | Fast/low-complexity | `explore`, `style-reviewer` | Uses the spark/low-complexity default. |
@@ -250,7 +250,7 @@ Supported reasoning-effort surfaces are:
 - Team worker launch args, for example:
 
 ```bash
-OMX_TEAM_WORKER_LAUNCH_ARGS='-c model_reasoning_effort="low" --model gpt-5.3-codex-spark' \
+OMX_TEAM_WORKER_LAUNCH_ARGS='-c model_reasoning_effort="low" --model gpt-5.6-luna' \
   omx team 3:explore "map the config surfaces"
 ```
 
@@ -267,14 +267,14 @@ This keeps orchestration on the frontier default, routes standard workers to a c
 ```json
 {
   "env": {
-    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.5",
-    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.4-mini",
-    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.3-codex-spark"
+    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.6-sol",
+    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.6-terra",
+    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.6-luna"
   },
   "models": {
-    "default": "gpt-5.4-mini",
-    "team": "gpt-5.5",
-    "team_low_complexity": "gpt-5.3-codex-spark"
+    "default": "gpt-5.6-terra",
+    "team": "gpt-5.6-sol",
+    "team_low_complexity": "gpt-5.6-luna"
   }
 }
 ```
@@ -286,10 +286,10 @@ This keeps standard agents inheriting the frontier model by omitting `OMX_DEFAUL
 ```json
 {
   "agentModels": {
-    "planner": "gpt-5.5",
-    "architect": "gpt-5.5",
-    "researcher": "gpt-5.5",
-    "explore": "gpt-5.5"
+    "planner": "gpt-5.6-sol",
+    "architect": "gpt-5.6-sol",
+    "researcher": "gpt-5.6-terra",
+    "explore": "gpt-5.6-luna"
   },
   "agentReasoning": {
     "planner": "medium",
@@ -299,15 +299,15 @@ This keeps standard agents inheriting the frontier model by omitting `OMX_DEFAUL
     "critic": "xhigh"
   },
   "env": {
-    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.5",
-    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.3-codex-spark"
+    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.6-sol",
+    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.6-luna"
   },
   "models": {
-    "default": "gpt-5.5",
-    "team": "gpt-5.5",
-    "autopilot": "gpt-5.5",
-    "ralph": "gpt-5.5",
-    "team_low_complexity": "gpt-5.3-codex-spark"
+    "default": "gpt-5.6-sol",
+    "team": "gpt-5.6-sol",
+    "autopilot": "gpt-5.6-sol",
+    "ralph": "gpt-5.6-sol",
+    "team_low_complexity": "gpt-5.6-luna"
   }
 }
 ```
