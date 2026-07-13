@@ -15,7 +15,7 @@ This skill activates when:
 - After implementing a major feature
 - User wants quality assessment
 
-## GPT-5.5 Guidance Alignment
+## GPT-5.6 Guidance Alignment
 
 - Default to outcome-first progress and completion reporting: state the target result, evidence, validation status, and stop condition before adding process detail.
 - Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints.
@@ -66,6 +66,22 @@ Delegates to the `code-reviewer` and `architect` agents in parallel for a two-la
      - Else if architect status is **WATCH**, final recommendation is **COMMENT**
      - Else final recommendation follows the `code-reviewer` lane
    - The final report must make architect blockers impossible to miss
+
+
+## State/HUD Phase Contract
+
+Code-review is a merge-readiness gate and Autopilot child phase, not a standalone tracked mode with a `code-review-state.json` lifecycle. Keep HUD/current-phase state explicit and minimal:
+
+- **Standalone `$code-review` activation**: rely on the hook-owned `skill-active-state.json` entry (`skill:"code-review"`, `phase:"planning"`) for HUD visibility; do not create an ad-hoc `code-review-state.json`.
+- **Inside active Autopilot**: before review work starts, keep `mode:"autopilot"` active and set the supervised phase to `current_phase:"code-review"` / skill-active `phase:"code-review"`; do not activate a peer workflow over Autopilot.
+- **On clean review**: persist the review artifact/verdict under Autopilot `handoff_artifacts.code_review` and transition Autopilot to `current_phase:"ultraqa"` only after durable independent review evidence exists.
+- **On non-clean review**: persist the review artifact/verdict, set Autopilot `current_phase:"rework"` for implementation-only fixes or `current_phase:"ralplan"` when requirements/planning must change, and keep the findings as the scoped handoff.
+
+Minimal Autopilot phase declaration when the review stage begins:
+
+```sh
+omx state write --input '{"mode":"autopilot","active":true,"current_phase":"code-review"}' --json
+```
 
 ## Agent Delegation
 

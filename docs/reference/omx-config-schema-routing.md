@@ -25,6 +25,7 @@ Current code recognizes these top-level `.omx-config.json` keys:
 
 | Top-level key | Supported shape | Primary use |
 | --- | --- | --- |
+| `agentModels` | Object mapping agent names to non-empty model strings | Optional per-agent model overrides for generated native agent TOML, AGENTS.md model tables, and role-based worker/Ralph fallback routing. |
 | `agentReasoning` | Object mapping agent names to `low`, `medium`, `high`, or `xhigh` | Optional per-agent reasoning overrides for generated native agent TOML and role-based worker/Ralph staffing guidance. |
 | `env` | Object of non-empty string values | Fallback environment values for model routing and helper launch paths. Model-related supported keys are listed below. |
 | `models` | Object of non-empty string values | Mode defaults and low-complexity model aliases. Supported model-routing keys are listed below. |
@@ -51,23 +52,29 @@ Use [`docs/discord-integration.md`](../discord-integration.md) for Discord webho
 
 ## Supported model/env keys
 
-The model-routing reader supports `env`, `models`, and the role-reasoning override map `agentReasoning`.
+The model-routing reader supports `env`, `models`, and the per-role override maps `agentModels` and `agentReasoning`.
 
 ```json
 {
+  "agentModels": {
+    "planner": "gpt-5.6-sol",
+    "architect": "gpt-5.6-sol",
+    "researcher": "gpt-5.6-terra",
+    "explore": "gpt-5.6-luna"
+  },
   "agentReasoning": {
     "architect": "xhigh",
     "critic": "xhigh"
   },
   "env": {
-    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.5",
-    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.4-mini",
-    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.3-codex-spark"
+    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.6-sol",
+    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.6-terra",
+    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.6-luna"
   },
   "models": {
-    "default": "gpt-5.5",
-    "team": "gpt-5.5",
-    "team_low_complexity": "gpt-5.3-codex-spark"
+    "default": "gpt-5.6-sol",
+    "team": "gpt-5.6-sol",
+    "team_low_complexity": "gpt-5.6-luna"
   }
 }
 ```
@@ -102,21 +109,52 @@ For `omx sparkshell`, the documented helper-specific environment keys are:
 
 `models` maps mode names to explicit model overrides. Values must be non-empty strings.
 
+The built-in defaults are `gpt-5.6-sol` (frontier), `gpt-5.6-terra` (standard), and `gpt-5.6-luna` (spark); the known-alias list contains exactly these three GPT-5.6 models. Legacy prior-generation names (for example `gpt-5.5`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`) are not aliases and carry no special routing meaning; like any provider-specific model name, they pass through only as opaque override strings. The known-alias list is used for display and contract tests, not as a closed allow-list.
+
+
 Supported model-routing keys:
 
 | Key shape | Purpose |
 | --- | --- |
 | `default` | Fallback for `getModelForMode(mode)` when the requested mode has no explicit key. |
-| Any mode key, for example `team`, `autopilot`, `ralph` | Explicit model for that mode when code calls `getModelForMode("mode")`. |
+| Any mode key, for example `team`, `autopilot`, `ralph` | Explicit model for that mode when code calls `getModelForMode("mode")`. If `models.autopilot` or the inherited main/default model is cheap/mini, Autopilot records dedicated planner ownership for heavy ralplan planning. |
 | `team_low_complexity` | Low-complexity team/spark model override. |
 | `team-low-complexity` | Alias for `team_low_complexity`. |
 | `teamLowComplexity` | Alias for `team_low_complexity`. |
 
 Do not invent per-role maps such as `models.executor`, `models.architect`, or `models.roles` unless your installed version documents that exact key. Current role routing is based on agent definitions and model class, not arbitrary per-role JSON maps.
 
+### `agentModels`
+
+`agentModels` is the supported per-agent model override map. Keys are normalized OMX agent names using the same normalization as `agentReasoning`: case-insensitive agent names containing letters, numbers, underscores, and hyphens. Values must be non-empty strings. Malformed agent names, empty values, and non-string values are ignored rather than fatal.
+
+```json
+{
+  "agentModels": {
+    "architect": "gpt-5.6-sol",
+    "planner": "gpt-5.6-sol",
+    "researcher": "gpt-5.6-terra",
+    "explore": "gpt-5.6-luna"
+  }
+}
+```
+
+These overrides do not change built-in defaults in source. They are user/project configuration that applies when OMX resolves generated native agent TOML, generated developer metadata/instructions, AGENTS.md model capability tables, and role-based team/Ralph fallback model selection. Rerun `omx setup --force` after changing this map so setup-managed native agent TOML and AGENTS.md managed sections are regenerated.
+
+For a named role, effective model precedence is:
+
+1. `.omx-config.json` `agentModels[role]`
+2. Built-in `exactModel` pins, such as planner/architect `gpt-5.6-sol` or researcher `gpt-5.6-terra`
+3. Special role logic, such as `executor` using the main/frontier lane
+4. `modelClass` routing: `fast` uses spark/low-complexity, `frontier` uses main/frontier, and `standard` uses the standard lane
+
+`agentModels` is the durable per-role surface. Do not put per-role models under `models.executor`, `models.architect`, or `models.roles`.
+
 ### `agentReasoning`
 
 `agentReasoning` is the supported per-agent reasoning override map. Keys are agent names and values must be one of `low`, `medium`, `high`, or `xhigh`.
+
+`xhigh` is the canonical highest reasoning effort token accepted by Codex/OMX. Reported names such as `max` or `ultra` are ambiguous and are not accepted aliases; use `xhigh` instead.
 
 ```json
 {
@@ -131,6 +169,8 @@ These overrides do not change built-in defaults in source. They are user/project
 
 ## Effective model precedence
 
+For generated native agents and role-based worker/Ralph fallback routing, `agentModels[role]` is checked before built-in exact pins and model-class routing. The sections below describe the lane defaults used when no per-agent override exists.
+
 ### Main/frontier default
 
 The main default resolves in this order:
@@ -138,7 +178,7 @@ The main default resolves in this order:
 1. Shell `OMX_DEFAULT_FRONTIER_MODEL`
 2. `.omx-config.json` `env.OMX_DEFAULT_FRONTIER_MODEL`
 3. Active Codex `config.toml` root `model`
-4. Built-in default: `gpt-5.5`
+4. Built-in default: `gpt-5.6-sol`
 
 ### Mode-specific model lookup
 
@@ -148,7 +188,7 @@ When code asks for `getModelForMode(mode)`, the mode model resolves in this orde
 2. `.omx-config.json` `models.default`
 3. Main/frontier default above
 
-Example: with `models.team = "gpt-5.5"` and `models.default = "gpt-5.4-mini"`, `team` uses `gpt-5.5`; a mode without its own key uses `gpt-5.4-mini`.
+Example: with `models.team = "gpt-5.6-sol"` and `models.default = "gpt-5.6-terra"`, `team` uses `gpt-5.6-sol`; a mode without its own key uses `gpt-5.6-terra`.
 
 ### Standard-lane agents
 
@@ -169,19 +209,19 @@ Spark/fast defaults resolve in this order:
 3. `.omx-config.json` `env.OMX_DEFAULT_SPARK_MODEL`
 4. `.omx-config.json` legacy `env.OMX_SPARK_MODEL`
 5. `.omx-config.json` `models.team_low_complexity`, `models.team-low-complexity`, or `models.teamLowComplexity`
-6. Built-in default: `gpt-5.3-codex-spark`
+6. Built-in default: `gpt-5.6-luna`
 
 For team low-complexity helpers, the exact order depends on the call path: `getSparkDefaultModel()` checks spark env/config values before low-complexity aliases, while `getTeamLowComplexityModel()` checks low-complexity aliases before falling back to the spark default.
 
 ## Role/category routing examples
 
-Native agent TOML generation and team model-contract logic use agent definitions with `modelClass`, optional `exactModel`, and `reasoningEffort` metadata. Exact-model pins win before class-based routing. Native-agent generation has one important frontier-lane precedence detail: for frontier roles and the `executor` special case, it reads the active Codex `config.toml` root `model` first, then falls back to `getMainDefaultModel()` if that root model is absent. Because `getMainDefaultModel()` is only the fallback in this path, `.omx-config.json` `env.OMX_DEFAULT_FRONTIER_MODEL` does not override an explicit `config.toml` root `model` for generated native-agent TOML.
+Native agent TOML generation and team model-contract logic use agent definitions with `modelClass`, optional `exactModel`, and `reasoningEffort` metadata. Per-agent `agentModels[role]` overrides win first. Exact-model pins win before class-based routing only when no per-agent model override exists. Native-agent generation has one important frontier-lane precedence detail: for frontier roles and the `executor` special case, it reads the active Codex `config.toml` root `model` first, then falls back to `getMainDefaultModel()` if that root model is absent. Because `getMainDefaultModel()` is only the fallback in this path, `.omx-config.json` `env.OMX_DEFAULT_FRONTIER_MODEL` does not override an explicit `config.toml` root `model` for generated native-agent TOML.
 
 Examples:
 
 | Role/category | Examples | Model class behavior |
 | --- | --- | --- |
-| Exact mini planning/research | `planner`, `architect`, `researcher` | Uses the exact `gpt-5.4-mini` pin before model-class routing; planner/architect keep `frontier-orchestrator` posture and high reasoning, while ralplan's `critic` remains frontier-routed for the consensus gate. |
+| Exact planning/research pins | `planner`, `architect`, `researcher` | Uses the built-in `exactModel` pin before model-class routing unless `agentModels[role]` is set; planner uses exact `gpt-5.6-sol` with medium reasoning, architect uses exact `gpt-5.6-sol` with xhigh reasoning, and researcher stays on exact `gpt-5.6-terra`. Ralplan's `critic` remains frontier-routed for the consensus gate. In Autopilot, `planning_routing.owner` switches the initial ralplan Planner draft/decomposition to this dedicated `planner` role when `[main]` is cheap/mini or when `agentModels.planner` is configured. |
 | Frontier orchestration | `critic`, `code-reviewer`, `security-reviewer`, `team-executor`, `vision` | Native-agent generation uses active `config.toml` root `model` first, then the main/frontier default fallback. |
 | Standard worker/review | `debugger`, `quality-reviewer`, `api-reviewer`, `performance-reviewer`, `dependency-expert`, `writer` | Uses the standard-lane default, which inherits main/frontier unless `OMX_DEFAULT_STANDARD_MODEL` is set. |
 | Fast/low-complexity | `explore`, `style-reviewer` | Uses the spark/low-complexity default. |
@@ -210,7 +250,7 @@ Supported reasoning-effort surfaces are:
 - Team worker launch args, for example:
 
 ```bash
-OMX_TEAM_WORKER_LAUNCH_ARGS='-c model_reasoning_effort="low" --model gpt-5.3-codex-spark' \
+OMX_TEAM_WORKER_LAUNCH_ARGS='-c model_reasoning_effort="low" --model gpt-5.6-luna' \
   omx team 3:explore "map the config surfaces"
 ```
 
@@ -227,38 +267,47 @@ This keeps orchestration on the frontier default, routes standard workers to a c
 ```json
 {
   "env": {
-    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.5",
-    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.4-mini",
-    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.3-codex-spark"
+    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.6-sol",
+    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.6-terra",
+    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.6-luna"
   },
   "models": {
-    "default": "gpt-5.4-mini",
-    "team": "gpt-5.5",
-    "team_low_complexity": "gpt-5.3-codex-spark"
+    "default": "gpt-5.6-terra",
+    "team": "gpt-5.6-sol",
+    "team_low_complexity": "gpt-5.6-luna"
   }
 }
 ```
 
 ### Max-quality starter
 
-This keeps standard agents inheriting the frontier model by omitting `OMX_DEFAULT_STANDARD_MODEL`, while still preserving a fast spark lane for explicit low-complexity routing.
+This keeps standard agents inheriting the frontier model by omitting `OMX_DEFAULT_STANDARD_MODEL`, keeps a fast spark lane for default low-complexity routing, and explicitly promotes selected exact-pinned/generated roles to a max-quality model with matching reasoning overrides.
 
 ```json
 {
+  "agentModels": {
+    "planner": "gpt-5.6-sol",
+    "architect": "gpt-5.6-sol",
+    "researcher": "gpt-5.6-terra",
+    "explore": "gpt-5.6-luna"
+  },
   "agentReasoning": {
+    "planner": "medium",
     "architect": "xhigh",
+    "researcher": "high",
+    "explore": "medium",
     "critic": "xhigh"
   },
   "env": {
-    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.5",
-    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.3-codex-spark"
+    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.6-sol",
+    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.6-luna"
   },
   "models": {
-    "default": "gpt-5.5",
-    "team": "gpt-5.5",
-    "autopilot": "gpt-5.5",
-    "ralph": "gpt-5.5",
-    "team_low_complexity": "gpt-5.3-codex-spark"
+    "default": "gpt-5.6-sol",
+    "team": "gpt-5.6-sol",
+    "autopilot": "gpt-5.6-sol",
+    "ralph": "gpt-5.6-sol",
+    "team_low_complexity": "gpt-5.6-luna"
   }
 }
 ```

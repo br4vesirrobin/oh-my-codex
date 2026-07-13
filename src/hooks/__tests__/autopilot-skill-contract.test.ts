@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const autopilotSkill = readFileSync(join(__dirname, '../../../skills/autopilot/SKILL.md'), 'utf-8');
 const ralplanSkill = readFileSync(join(__dirname, '../../../skills/ralplan/SKILL.md'), 'utf-8');
+const codeReviewSkill = readFileSync(join(__dirname, '../../../skills/code-review/SKILL.md'), 'utf-8');
+const ultragoalSkill = readFileSync(join(__dirname, '../../../skills/ultragoal/SKILL.md'), 'utf-8');
 const pipelineSkill = readFileSync(join(__dirname, '../../../skills/pipeline/SKILL.md'), 'utf-8');
 const skillsDocs = readFileSync(join(__dirname, '../../../docs/skills.html'), 'utf-8');
 const gettingStartedDocs = readFileSync(join(__dirname, '../../../docs/getting-started.html'), 'utf-8');
@@ -39,6 +41,17 @@ describe('autopilot skill default Ultragoal contract', () => {
     }
   });
 
+  it('documents minimal state/HUD contracts for code-review and ultragoal child phases', () => {
+    assert.match(codeReviewSkill, /State\/HUD Phase Contract/);
+    assert.match(codeReviewSkill, /not a standalone tracked mode with a `code-review-state\.json` lifecycle/i);
+    assert.match(codeReviewSkill, /skill-active-state\.json.*skill:"code-review".*phase:"planning"/s);
+    assert.match(codeReviewSkill, /current_phase":"code-review"/);
+    assert.match(ultragoalSkill, /State\/HUD Phase Contract/);
+    assert.match(ultragoalSkill, /mode:"ultragoal".*active:true.*current_phase/s);
+    assert.match(ultragoalSkill, /current_phase":"ultragoal"/);
+    assert.match(ultragoalSkill, /handoff_artifacts\.ultragoal/);
+  });
+
   it('forbids self-attesting clean review and QA gates without durable stage evidence', () => {
     assert.match(autopilotSkill, /Do not author `review_verdict:\{clean:true\}` from the leader's own summary/i);
     assert.match(autopilotSkill, /both gates have durable source evidence/i);
@@ -55,6 +68,14 @@ describe('autopilot skill default Ultragoal contract', () => {
     assert.match(autopilotSkill, /ralplan_consensus_gate/);
     assert.match(autopilotSkill, /missing ralplan consensus evidence/i);
     assert.match(autopilotSkill, /do not progress to `\$ultragoal`, `\$team`, `\$ralph`, or implementation/i);
+  });
+
+  it('documents dedicated planner routing when Autopilot main is cheap or mini', () => {
+    assert.match(autopilotSkill, /planning_routing/i);
+    assert.match(autopilotSkill, /cheap\/mini lane[\s\S]*`\[main\]`/i);
+    assert.match(autopilotSkill, /dedicated `\[planner\]`/i);
+    assert.match(ralplanSkill, /`agentModels\.planner`/i);
+    assert.match(ralplanSkill, /initial Planner draft/i);
   });
 
   it('documents optional deep-interview execution contract validation without broadness inference', () => {

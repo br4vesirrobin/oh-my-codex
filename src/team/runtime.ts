@@ -12,8 +12,8 @@ import {
   buildWorkerProcessLaunchSpec,
   scrubTeamWorkerHudOwnershipEnv,
   resolveTeamWorkerCli,
+  resolveTeamWorkerCliForResolvedLaunchArgs,
   type TeamWorkerCli,
-  resolveTeamWorkerCliPlan,
   resolveTeamWorkerLaunchMode,
   type TeamSession,
   waitForWorkerReady,
@@ -26,6 +26,8 @@ import {
   isWorkerPaneOpen,
   getWorkerPanePid,
   killWorkerByPaneIdAsync,
+  paneHasOmxInstanceTag,
+  readPaneTeamOwnerTagResult,
   restoreStandaloneHudPane,
   teardownWorkerPanes,
   unregisterResizeHook,
@@ -119,11 +121,13 @@ import { codexPromptsDir } from '../utils/paths.js';
 import { isTerminalPhase, type TeamPhase, type TerminalPhase } from './orchestrator.js';
 import {
   resolveTeamWorkerLaunchArgs,
+  resolveTeamWorkerLaunchDiagnostics,
   TEAM_LOW_COMPLEXITY_DEFAULT_MODEL,
+  TEAM_WORKER_INHERITED_MODEL_ENV,
   parseTeamWorkerLaunchArgs,
-  splitWorkerLaunchArgs,
   resolveAgentDefaultModel,
   resolveAgentReasoningEffort,
+  shouldHonorAgentExactModel,
   type TeamReasoningEffort,
 } from './model-contract.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
@@ -134,6 +138,9 @@ import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
 import { buildRebalanceDecisions } from './rebalance-policy.js';
 import { getStatePath } from '../mcp/state-paths.js';
 import { readModeState, updateModeState } from '../modes/base.js';
+import { resolveWorktreeToolContext, worktreeToolContextEnv } from '../utils/worktree-tool-context.js';
+
+export { resolveTeamWorkerCliForResolvedLaunchArgs };
 import {
   buildApprovedTeamHandoffSection,
   buildApprovedTeamExecutionBinding,
@@ -359,6 +366,7 @@ export function applyCreatedInteractiveSessionToConfig(
   config.tmux_session = createdSession.name;
   config.leader_pane_id = createdSession.leaderPaneId;
   config.hud_pane_id = createdSession.hudPaneId;
+  config.tmux_pane_owner_id = createdSession.teamPaneOwnerId;
   config.resize_hook_name = createdSession.resizeHookName;
   config.resize_hook_target = createdSession.resizeHookTarget;
   for (let i = 0; i < createdSession.workerPaneIds.length; i++) {
@@ -372,14 +380,16 @@ export function applyCreatedInteractiveSessionToConfig(
 
 function collectShutdownPaneIds(params: {
   config: TeamConfig;
-  livePaneIds?: string[];
+  candidatePaneIds?: string[];
+  includePersistedWorkerPaneIds?: boolean;
   restoredStandaloneHudPaneId?: string | null;
   leaderPaneId?: string | null;
   hudPaneId?: string | null;
 }): string[] {
   const {
     config,
-    livePaneIds = [],
+    candidatePaneIds = [],
+    includePersistedWorkerPaneIds = true,
     restoredStandaloneHudPaneId = null,
     leaderPaneId = config.leader_pane_id,
     hudPaneId = config.hud_pane_id,
@@ -394,8 +404,8 @@ function collectShutdownPaneIds(params: {
 
   const paneIds = new Set<string>();
   for (const paneId of [
-    ...config.workers.map((worker) => worker.pane_id),
-    ...livePaneIds,
+    ...(includePersistedWorkerPaneIds ? config.workers.map((worker) => worker.pane_id) : []),
+    ...candidatePaneIds,
   ]) {
     if (typeof paneId !== 'string') continue;
     const normalized = paneId.trim();
@@ -405,6 +415,64 @@ function collectShutdownPaneIds(params: {
   }
 
   return [...paneIds];
+}
+
+function filterSharedSessionShutdownWorkerPaneIdsByOwner(
+  paneIds: string[],
+  teamPaneOwnerId: string,
+  legacyPersistedWorkerPaneIds: ReadonlySet<string> = new Set<string>(),
+  onOwnerReadError?: (paneId: string, error: string) => void,
+): string[] {
+  const expectedOwnerId = teamPaneOwnerId.trim();
+  if (!expectedOwnerId) return [];
+  return paneIds.filter((paneId) => {
+    const actualOwnerId = readPaneTeamOwnerTagResult(paneId);
+    if (actualOwnerId.status === 'value') return actualOwnerId.value === expectedOwnerId;
+    if (actualOwnerId.status === 'missing') {
+      // Legacy, already-running Team panes may not have @omx_team_pane_owner_id.
+      // Keep that compatibility path explicitly bounded to panes that are both
+      // live worker-command candidates and persisted in this team's state. This
+      // preserves old Team cleanup without letting arbitrary worker-looking
+      // panes become kill candidates merely because the owner tag is absent.
+      return legacyPersistedWorkerPaneIds.has(paneId);
+    }
+    onOwnerReadError?.(paneId, actualOwnerId.error);
+    return false;
+  });
+}
+
+function isSharedSessionHudPaneReclaimable(params: {
+  paneId: string;
+  persistedHudPaneId: string | null;
+  leaderOwnedHudPaneIds: string[];
+  teamPaneOwnerId: string;
+  onOwnerReadError?: (paneId: string, error: string) => void;
+}): boolean {
+  const { paneId, persistedHudPaneId, leaderOwnedHudPaneIds, teamPaneOwnerId, onOwnerReadError } = params;
+  const expectedOwnerId = teamPaneOwnerId.trim();
+  if (!expectedOwnerId) return false;
+  const owner = readPaneTeamOwnerTagResult(paneId);
+  if (owner.status === 'value') return owner.value === expectedOwnerId;
+  if (paneId !== persistedHudPaneId) return false;
+  if (owner.status === 'missing') return leaderOwnedHudPaneIds.includes(paneId);
+  onOwnerReadError?.(paneId, owner.error);
+  return false;
+}
+
+function isTrustedSharedSessionLeaderPaneForHudRestore(params: {
+  paneId: string | null;
+  teamPaneOwnerId: string;
+  legacyInstanceId: string;
+}): boolean {
+  const { paneId, teamPaneOwnerId, legacyInstanceId } = params;
+  if (!paneId) return false;
+  const expectedOwnerId = teamPaneOwnerId.trim();
+  if (expectedOwnerId) {
+    const owner = readPaneTeamOwnerTagResult(paneId);
+    if (owner.status === 'value') return owner.value === expectedOwnerId;
+    if (owner.status === 'error') return false;
+  }
+  return paneHasOmxInstanceTag(paneId, legacyInstanceId);
 }
 
 export function shouldPrekillInteractiveShutdownProcessTrees(sessionName: string): boolean {
@@ -1586,7 +1654,7 @@ function assertPromptModeWorkerCliSupported(workerCliPlan: readonly TeamWorkerCl
 function resolveWorkerReadyTimeoutMs(env: NodeJS.ProcessEnv): number {
   const raw = env.OMX_TEAM_READY_TIMEOUT_MS;
   const parsed = Number.parseInt(String(raw ?? ''), 10);
-  if (Number.isFinite(parsed) && parsed >= 5_000) return parsed;
+  if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
   return 45_000;
 }
 
@@ -1595,7 +1663,7 @@ function resolveWorkerStartupEvidenceTimeoutMs(
   workerReadyTimeoutMs: number,
 ): number {
   const raw = Number.parseInt(String(env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS ?? ''), 10);
-  if (Number.isFinite(raw) && raw >= 500) return raw;
+  if (Number.isFinite(raw) && raw >= 0) return Math.floor(raw);
   return Math.max(
     STARTUP_EVIDENCE_TIMEOUT_MS,
     Math.min(workerReadyTimeoutMs, STARTUP_EVIDENCE_LAUNCH_TIMEOUT_MS),
@@ -2265,38 +2333,43 @@ export function resolveWorkerLaunchArgsFromEnv(
   preferredReasoning?: TeamReasoningEffort,
   workerCliOverride?: TeamWorkerCli,
 ): string[] {
-  const inheritedArgs = (typeof inheritedLeaderModel === 'string' && inheritedLeaderModel.trim() !== '')
-    ? ['--model', inheritedLeaderModel.trim()]
+  const inheritedFromEnv = typeof env[TEAM_WORKER_INHERITED_MODEL_ENV] === 'string'
+    ? env[TEAM_WORKER_INHERITED_MODEL_ENV]?.trim()
+    : undefined;
+  const effectiveInheritedModel = typeof inheritedLeaderModel === 'string' && inheritedLeaderModel.trim() !== ''
+    ? inheritedLeaderModel.trim()
+    : inheritedFromEnv;
+  const inheritedArgs = effectiveInheritedModel
+    ? ['--model', effectiveInheritedModel]
     : [];
   const fallbackModel = resolveAgentDefaultModel(agentType, env.CODEX_HOME);
-
-  // Detect if an explicit reasoning override exists before resolving (for log source labelling)
-  const preEnvArgs = splitWorkerLaunchArgs(env.OMX_TEAM_WORKER_LAUNCH_ARGS);
-  const preAllArgs = [...preEnvArgs, ...inheritedArgs];
-  const hasExplicitReasoning = parseTeamWorkerLaunchArgs(preAllArgs).reasoningOverride !== null;
-
-  const resolved = resolveTeamWorkerLaunchArgs({
+  const diagnostics = resolveTeamWorkerLaunchDiagnostics({
     existingRaw: env.OMX_TEAM_WORKER_LAUNCH_ARGS,
     inheritedArgs,
     fallbackModel,
     preferredReasoning,
+    honorExactRoleModel: shouldHonorAgentExactModel(agentType, env.CODEX_HOME),
+    requestedAgentType: agentType,
   });
 
-  // Extract resolved model and thinking level from result args for startup log
-  const resolvedParsed = parseTeamWorkerLaunchArgs(resolved);
-  const resolvedModel = resolvedParsed.modelOverride ?? fallbackModel ?? 'default';
-  const reasoningMatch = resolvedParsed.reasoningOverride?.match(/model_reasoning_effort\s*=\s*"?(\w+)"?/);
-  const thinkingLevel = reasoningMatch?.[1] ?? 'none';
-  const source = hasExplicitReasoning
-    ? 'explicit'
-    : (preferredReasoning ? 'role-default' : 'none/default-none');
+  const resolved = diagnostics.actualLaunchArgs;
+  const resolvedModel = diagnostics.actualModel ?? diagnostics.requestedDefaultModel ?? 'default';
+  const thinkingLevel = diagnostics.actualReasoning ?? 'none';
+  const source = diagnostics.reasoningSource === 'none'
+    ? 'none/default-none'
+    : diagnostics.reasoningSource;
+  const modelSource = diagnostics.modelSource;
+  const inheritedParentModel = diagnostics.inheritedParentModel ? 'yes' : 'no';
+  const requestedRole = diagnostics.requestedAgentType ?? 'unknown';
+  const requestedDefaultModel = diagnostics.requestedDefaultModel ?? 'none';
+  const requestedDefaultReasoning = diagnostics.requestedDefaultReasoning ?? 'none';
   const effectiveWorkerCli = workerCliOverride ?? resolveEffectiveWorkerCliForStartupLog(resolved, env);
   if (effectiveWorkerCli === 'claude') {
     console.log('[omx:team] worker startup resolution: model=claude source=local-settings');
   } else if (effectiveWorkerCli === 'gemini') {
     console.log('[omx:team] worker startup resolution: model=gemini source=local-settings');
   } else {
-    console.log(`[omx:team] worker startup resolution: model=${resolvedModel} thinking_level=${thinkingLevel} source=${source}`);
+    console.log(`[omx:team] worker startup resolution: requested_role=${requestedRole} requested_default_model=${requestedDefaultModel} requested_default_reasoning=${requestedDefaultReasoning} actual_model=${resolvedModel} thinking_level=${thinkingLevel} model_source=${modelSource} reasoning_source=${source} inherited_parent_model=${inheritedParentModel}`);
   }
 
   return resolved;
@@ -2525,10 +2598,6 @@ export async function startTeam(
     existingRaw: launchEnv.OMX_TEAM_WORKER_LAUNCH_ARGS,
     fallbackModel: resolveAgentDefaultModel(agentType, codexHomeOverride),
   });
-  const workerCliPlan = resolveTeamWorkerCliPlan(workerCount, sharedWorkerLaunchArgs, launchEnv);
-  if (workerLaunchMode === 'prompt') {
-    assertPromptModeWorkerCliSupported(workerCliPlan);
-  }
   const workerReadyTimeoutMs = resolveWorkerReadyTimeoutMs(launchEnv);
   const workerStartupEvidenceTimeoutMs = resolveWorkerStartupEvidenceTimeoutMs(
     launchEnv,
@@ -2668,7 +2737,9 @@ export async function startTeam(
       initialPrompt?: string;
       workerLaunchArgs: string[];
       workerCli: TeamWorkerCli;
+      toolContext: ReturnType<typeof resolveWorktreeToolContext>;
     }>;
+    const workerCliPlan: TeamWorkerCli[] = [];
 
     for (let i = 1; i <= workerCount; i++) {
       const workerName = `worker-${i}`;
@@ -2689,13 +2760,20 @@ export async function startTeam(
         runtimeRole,
         undefined,
         preferredReasoning,
-        workerCliPlan[i - 1],
       );
+      const workerCli = resolveTeamWorkerCliForResolvedLaunchArgs(i, workerCount, workerLaunchArgs, launchEnv);
       const resolvedWorkerModel = parseTeamWorkerLaunchArgs(workerLaunchArgs).modelOverride ?? undefined;
       const rolePromptContent = rawRolePromptContent
         ? composeRoleInstructionsForRole(runtimeRole, rawRolePromptContent, resolvedWorkerModel)
         : null;
       const workerWorktreePath = workerWorkspace.worktreePath ?? undefined;
+      const toolContext = resolveWorktreeToolContext({
+        cwd: workerWorkspace.cwd,
+        scope: 'team',
+        repoRoot: workerWorkspace.worktreeRepoRoot ?? leaderCwd,
+        worktreeRoot: workerWorkspace.worktreePath ?? workerWorkspace.cwd,
+        env: launchEnv,
+      });
       const fallbackInstructionsPath = workerInstructionsPath ?? join(leaderCwd, 'AGENTS.md');
       const instructionsFilePath = workerWorktreePath
         ? await writeWorkerWorktreeRootAgentsFile({
@@ -2706,6 +2784,7 @@ export async function startTeam(
           teamStateRoot,
           leaderCwd,
           worktreePath: workerWorktreePath,
+          toolContext,
         })
         : rolePromptContent
           ? await writeWorkerRoleInstructionsFile(sanitized, workerName, leaderCwd, fallbackInstructionsPath, runtimeRole, rolePromptContent)
@@ -2729,10 +2808,11 @@ export async function startTeam(
         resolveInstructionStateRoot(workerWorkspace.worktreePath),
       );
       const trigger = triggerDirective.text;
-      const initialPrompt = workerCliPlan[i - 1] === 'gemini' ? trigger : undefined;
+      const initialPrompt = workerCli === 'gemini' ? trigger : undefined;
       if (initialPrompt) {
         await writeWorkerInbox(sanitized, workerName, inbox, leaderCwd);
       }
+      workerCliPlan.push(workerCli);
       workerBootstrapPlans.push({
         workerName,
         workerWorkspace,
@@ -2745,8 +2825,12 @@ export async function startTeam(
         triggerIntent: triggerDirective.intent,
         initialPrompt,
         workerLaunchArgs,
-        workerCli: workerCliPlan[i - 1],
+        workerCli,
+        toolContext,
       });
+    }
+    if (workerLaunchMode === 'prompt') {
+      assertPromptModeWorkerCliSupported(workerCliPlan);
     }
 
     const workerStartups = workerBootstrapPlans.map((plan) => {
@@ -2756,6 +2840,7 @@ export async function startTeam(
         [MODEL_INSTRUCTIONS_FILE_ENV]: plan.instructionsFilePath,
         OMX_TEAM_DISPLAY_NAME: displayName,
         ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
+        ...worktreeToolContextEnv(plan.toolContext),
       };
       if (plan.workerWorkspace.worktreePath) {
         env.OMX_TEAM_WORKTREE_PATH = plan.workerWorkspace.worktreePath;
@@ -2846,7 +2931,14 @@ export async function startTeam(
     const startupTiming = createStartupTimingRecorder(sanitized, leaderCwd);
 
     if (workerLaunchMode === 'interactive') {
-      const createdSession = createTeamSession(sanitized, workerCount, leaderCwd, sharedWorkerLaunchArgs, workerStartups);
+      const createdSession = createTeamSession(
+        sanitized,
+        workerCount,
+        leaderCwd,
+        sharedWorkerLaunchArgs,
+        workerStartups,
+        { ownerSessionId: leaderSessionId, teamPaneOwnerId: config.tmux_pane_owner_id },
+      );
       sessionName = createdSession.name;
       sessionCreated = true;
       createdWorkerPaneIds.push(...createdSession.workerPaneIds);
@@ -3774,16 +3866,50 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   const hudPaneId = config.hud_pane_id;
   if (config.worker_launch_mode === 'interactive') {
     const sharedSessionTopology = sessionName.includes(':')
-      ? resolveSharedSessionShutdownTopology(sessionName, leaderPaneId)
+      ? resolveSharedSessionShutdownTopology(sessionName, leaderPaneId, sanitized)
       : null;
-    const effectiveLeaderPaneId = sharedSessionTopology?.leaderPaneId ?? leaderPaneId;
-    const effectiveHudPaneId = sharedSessionTopology?.hudPaneIds.find((paneId) => paneId === hudPaneId)
-      ?? sharedSessionTopology?.hudPaneIds[0]
-      ?? hudPaneId;
-    const livePaneIds = sharedSessionTopology?.livePaneIds ?? listPaneIds(sessionName);
+    const effectiveLeaderPaneId = sharedSessionTopology ? sharedSessionTopology.leaderPaneId : leaderPaneId;
+    const tmuxPaneOwnerId = typeof config.tmux_pane_owner_id === 'string' ? config.tmux_pane_owner_id.trim() : '';
+    const legacyPersistedWorkerPaneIds = new Set(
+      config.workers
+        .map((worker) => (typeof worker.pane_id === 'string' ? worker.pane_id.trim() : ''))
+        .filter((paneId) => paneId.startsWith('%')),
+    );
+    const ownerReadWarnings = new Set<string>();
+    const warnOwnerReadError = (kind: string, paneId: string, error: string): void => {
+      const key = `${kind}:${paneId}:${error}`;
+      if (ownerReadWarnings.has(key)) return;
+      ownerReadWarnings.add(key);
+      console.warn(`[team shutdown] ${sanitized}: skipped shared-session ${kind} ${paneId} because team owner tag could not be read: ${error}`);
+    };
+    const trustedHudRestoreLeaderPaneId = sharedSessionTopology
+      ? (isTrustedSharedSessionLeaderPaneForHudRestore({
+        paneId: effectiveLeaderPaneId,
+        teamPaneOwnerId: tmuxPaneOwnerId,
+        legacyInstanceId: leaderSessionId,
+      }) ? effectiveLeaderPaneId : null)
+      : effectiveLeaderPaneId;
+    const effectiveHudPaneId = sharedSessionTopology
+      ? (sharedSessionTopology.hudPaneIds.find((paneId) => isSharedSessionHudPaneReclaimable({
+        paneId,
+        persistedHudPaneId: hudPaneId,
+        leaderOwnedHudPaneIds: sharedSessionTopology.leaderOwnedHudPaneIds,
+        teamPaneOwnerId: tmuxPaneOwnerId,
+        onOwnerReadError: (hudPaneId, error) => warnOwnerReadError('HUD pane', hudPaneId, error),
+      })) ?? null)
+      : hudPaneId;
+    const shutdownCandidatePaneIds = sharedSessionTopology
+      ? filterSharedSessionShutdownWorkerPaneIdsByOwner(
+        sharedSessionTopology.teamWorkerPaneIds,
+        tmuxPaneOwnerId,
+        legacyPersistedWorkerPaneIds,
+        (paneId, error) => warnOwnerReadError('worker pane', paneId, error),
+      )
+      : listPaneIds(sessionName);
     let shutdownPaneIds = collectShutdownPaneIds({
       config,
-      livePaneIds,
+      candidatePaneIds: shutdownCandidatePaneIds,
+      includePersistedWorkerPaneIds: !sharedSessionTopology,
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: effectiveHudPaneId,
     });
@@ -3818,15 +3944,28 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     if (effectiveHudPaneId) {
       await killWorkerByPaneIdAsync(effectiveHudPaneId, effectiveLeaderPaneId ?? undefined);
       if (sessionName.includes(':')) {
-        restoredHudPaneId = restoreStandaloneHudPane(effectiveLeaderPaneId, cwd);
+        restoredHudPaneId = restoreStandaloneHudPane(trustedHudRestoreLeaderPaneId, cwd, {
+          sessionId: leaderSessionId,
+        });
         if (!restoredHudPaneId) {
-          console.warn(`[team shutdown] ${sanitized}: failed to restore standalone HUD pane`);
+          const reason = trustedHudRestoreLeaderPaneId
+            ? 'failed to restore standalone HUD pane'
+            : 'skipped standalone HUD restore because leader pane ownership could not be verified';
+          console.warn(`[team shutdown] ${sanitized}: ${reason}`);
         }
       }
     }
     shutdownPaneIds = collectShutdownPaneIds({
       config,
-      livePaneIds: listPaneIds(sessionName),
+      candidatePaneIds: sessionName.includes(':')
+        ? filterSharedSessionShutdownWorkerPaneIdsByOwner(
+          resolveSharedSessionShutdownTopology(sessionName, effectiveLeaderPaneId, sanitized).teamWorkerPaneIds,
+          tmuxPaneOwnerId,
+          legacyPersistedWorkerPaneIds,
+          (paneId, error) => warnOwnerReadError('worker pane', paneId, error),
+        )
+        : listPaneIds(sessionName),
+      includePersistedWorkerPaneIds: !sessionName.includes(':'),
       restoredStandaloneHudPaneId: restoredHudPaneId,
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: effectiveHudPaneId,

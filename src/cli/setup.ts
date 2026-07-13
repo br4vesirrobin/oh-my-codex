@@ -20,6 +20,8 @@ import { existsSync } from "fs";
 import { spawnSync } from "child_process";
 import { createInterface } from "readline/promises";
 import { homedir } from "os";
+import TOML from "@iarna/toml";
+import { createHash } from "crypto";
 import {
 	codexHome,
 	codexConfigPath,
@@ -47,6 +49,7 @@ import {
 	upsertPluginModeRuntimeFeatureFlags,
 	upsertManagedCodexHookTrustState,
 	stripManagedCodexHookTrustState,
+	OMX_DEVELOPER_INSTRUCTIONS,
 	OMX_PLUGIN_DEVELOPER_INSTRUCTIONS,
 	hasFirstPartyOmxMcpRegistrations,
 	extractFirstPartyOmxMcpSections,
@@ -58,6 +61,7 @@ import {
 	buildManagedCodexNativeHookWindowsShimContent,
 	buildManagedCodexNativeHookWindowsShimPath,
 	mergeManagedCodexHooksConfig,
+	extractCodexHooksJsonTrustState,
 	removeManagedCodexHooks,
 } from "../config/codex-hooks.js";
 import {
@@ -89,6 +93,7 @@ import {
 	hasOmxAgentsContract,
 	hasOmxManagedAgentsSections,
 	isOmxGeneratedAgentsMd,
+	preserveUserOmxPolicyBlocks,
 	upsertManagedAgentsBlock,
 } from "../utils/agents-md.js";
 import { DEFAULT_HUD_CONFIG, type HudPreset } from "../hud/types.js";
@@ -143,6 +148,14 @@ import {
 	upsertAgentsModelTable,
 } from "../utils/agents-model-table.js";
 
+type PluginDeveloperInstructionsDecisionAction = "add" | "update" | "preserve";
+
+interface PluginDeveloperInstructionsDecision {
+	action: PluginDeveloperInstructionsDecisionAction;
+	state: "missing" | "current" | "historical" | "custom";
+	reason: string;
+}
+
 interface SetupOptions {
 	codexFeaturesProbe?: () => string | null;
 	codexVersionProbe?: () => string | null;
@@ -155,6 +168,7 @@ interface SetupOptions {
 	scope?: SetupScope;
 	verbose?: boolean;
 	agentsOverwritePrompt?: (destinationPath: string) => Promise<boolean>;
+	skipNativeAgentRefresh?: boolean;
 	setupScopePrompt?: (defaultScope: SetupScope) => Promise<SetupScope>;
 	persistedSetupReviewPrompt?: (
 		preferences: Partial<PersistedSetupScope>,
@@ -167,10 +181,9 @@ interface SetupOptions {
 		targetModel: string,
 	) => Promise<boolean>;
 	pluginAgentsMdPrompt?: (destinationPath: string) => Promise<boolean>;
-	pluginDeveloperInstructionsPrompt?: (configPath: string) => Promise<boolean>;
-	pluginDeveloperInstructionsOverwritePrompt?: (
+	pluginDeveloperInstructionsPrompt?: (
 		configPath: string,
-	) => Promise<boolean>;
+	) => Promise<boolean | "skip" | "preserve-or-add" | "refresh">;
 	firstPartyMcpRemovalPrompt?: (
 		configPath: string,
 		registrationKinds: string[],
@@ -242,6 +255,7 @@ const PROJECT_GITIGNORE_ENTRIES = [
 const LEGACY_PROJECT_GITIGNORE_ENTRIES = [".codex/"] as const;
 const SETUP_ONLY_INSTALLABLE_SKILLS = new Set(["wiki"]);
 const DEFAULT_SETUP_MCP_MODE: SetupMcpMode = "none";
+const SKIP_NATIVE_AGENT_REFRESH_ENV = "OMX_SKIP_NATIVE_AGENT_REFRESH";
 const HARD_DEPRECATED_SKILL_NAMES = new Set(["web-clone"]);
 const TEAM_MODE_SKILL_NAMES = new Set(["team", "worker"]);
 const TEAM_MODE_PROMPT_NAMES = new Set(["team-executor"]);
@@ -369,7 +383,7 @@ const REQUIRED_TEAM_CLI_API_MARKERS = [
 
 const DEFAULT_SETUP_SCOPE: SetupScope = "user";
 const DEFAULT_SETUP_INSTALL_MODE: SetupInstallMode = "legacy";
-const LEGACY_SETUP_MODEL = "gpt-5.3-codex";
+const LEGACY_SETUP_MODELS = new Set(["gpt-5.3-codex", "gpt-5.5"]);
 const DEFAULT_SETUP_MODEL = DEFAULT_FRONTIER_MODEL;
 const OBSOLETE_NATIVE_AGENT_FIELD = ["skill", "ref"].join("_");
 const GITHUB_AUTH_STATUS_TIMEOUT_MS = 2_000;
@@ -411,6 +425,86 @@ function getBackupContext(
 		backupRoot: join(homedir(), ".omx", "backups", "setup", timestamp),
 		baseRoot: homedir(),
 	};
+}
+
+function escapeTomlBasicString(value: string): string {
+	return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function renderHooksJsonTrustStateToml(content: string | null | undefined): string {
+	const trustState = extractCodexHooksJsonTrustState(content);
+	return Object.entries(trustState)
+		.sort(([left], [right]) => left.localeCompare(right))
+		.flatMap(([key, state]) => [
+			`[hooks.state."${escapeTomlBasicString(key)}"]`,
+			`trusted_hash = "${escapeTomlBasicString(state.trusted_hash)}"`,
+			...(typeof state.enabled === "boolean" ? [`enabled = ${state.enabled}`] : []),
+			"",
+		])
+		.join("\n")
+		.trimEnd();
+}
+
+function existingHooksStateKeys(config: string): Set<string> {
+	try {
+		const parsed = TOML.parse(config) as {
+			hooks?: { state?: Record<string, unknown> };
+		};
+		return new Set(Object.keys(parsed.hooks?.state ?? {}));
+	} catch {
+		return new Set();
+	}
+}
+function appendHooksJsonTrustStateToConfig(
+	config: string,
+	hooksContent: string | null | undefined,
+): string {
+	const existingKeys = existingHooksStateKeys(config);
+	const trustState = extractCodexHooksJsonTrustState(hooksContent);
+	const migratableContent = JSON.stringify({
+		state: Object.fromEntries(
+			Object.entries(trustState).filter(([key]) => !existingKeys.has(key)),
+		),
+	});
+	const trustToml = renderHooksJsonTrustStateToml(migratableContent);
+	if (!trustToml) return config;
+	const base = config.trimEnd();
+	return [
+		base,
+		base ? "" : null,
+		"# Migrated from legacy hooks.json state; kept in Codex config.toml because Codex 0.140 rejects top-level hooks.json state.",
+		trustToml,
+		"",
+	].filter((line): line is string => line !== null).join("\n");
+}
+
+async function migrateLegacyHooksJsonTrustStateToConfig(
+	configPath: string,
+	hooksContent: string | null | undefined,
+	backupContext: SetupBackupContext,
+	summary: SetupCategorySummary,
+	options: Pick<SetupOptions, "dryRun" | "verbose">,
+): Promise<void> {
+	const existingConfig = existsSync(configPath)
+		? await readFile(configPath, "utf-8")
+		: "";
+	const nextConfig = appendHooksJsonTrustStateToConfig(existingConfig, hooksContent);
+	if (nextConfig === existingConfig) return;
+	if (
+		await ensureBackup(configPath, existsSync(configPath), backupContext, options)
+	) {
+		summary.backedUp += 1;
+	}
+	if (!options.dryRun) {
+		await mkdir(dirname(configPath), { recursive: true });
+		await writeFile(configPath, nextConfig);
+	}
+	summary.updated += 1;
+	if (options.verbose) {
+		console.log(
+			`  ${options.dryRun ? "would migrate" : "migrated"} legacy hooks.json trust state to ${configPath}`,
+		);
+	}
 }
 
 async function ensureBackup(
@@ -851,7 +945,7 @@ async function promptForPluginAgentsMdDefault(
 	destinationPath: string,
 ): Promise<boolean> {
 	if (!process.stdin.isTTY || !process.stdout.isTTY) {
-		return false;
+		return !existsSync(destinationPath);
 	}
 	const rl = createInterface({
 		input: process.stdin,
@@ -860,20 +954,60 @@ async function promptForPluginAgentsMdDefault(
 	try {
 		const answer = (
 			await rl.question(
-				`Plugin mode: install OMX AGENTS.md defaults at "${destinationPath}"? [y/N]: `,
+				`Plugin mode: install/update OMX AGENTS.md defaults at "${destinationPath}"? [Y/n]: `,
 			)
 		)
 			.trim()
 			.toLowerCase();
-		return answer === "y" || answer === "yes";
+		return answer === "" || answer === "y" || answer === "yes";
 	} finally {
 		rl.close();
 	}
 }
 
-async function promptForPluginDeveloperInstructionsDefault(
-	configPath: string,
-): Promise<boolean> {
+const LEGACY_PLUGIN_DEVELOPER_INSTRUCTIONS =
+	"You have oh-my-codex installed through Codex plugin mode. AGENTS.md is the orchestration brain and main control surface. Follow AGENTS.md for skill/keyword routing and $name workflow invocation. When spawning native subagents, set `agent_type` to an installed role and never omit it for OMX work. Registered Codex plugin marketplace surfaces supply OMX workflows and plugin-scoped companion resources when the plugin is installed; native agent roles are installed as setup-owned Codex agent TOML files in plugin mode so agent_type routing works. User-installed skills may still live under ~/.codex/skills. Use outcome-first, concise progress updates: state the target result, constraints, validation evidence, and stop condition before adding process detail.";
+
+function normalizeDeveloperInstructionsText(value: string): string {
+	return value.replace(/\r\n/g, "\n").trim();
+}
+
+function classifyPluginDeveloperInstructions(
+	value: unknown,
+): PluginDeveloperInstructionsDecision["state"] {
+	if (typeof value !== "string") return "custom";
+	const normalized = normalizeDeveloperInstructionsText(value);
+	if (
+		normalized ===
+		normalizeDeveloperInstructionsText(OMX_PLUGIN_DEVELOPER_INSTRUCTIONS)
+	) {
+		return "current";
+	}
+	if (
+		normalized ===
+		normalizeDeveloperInstructionsText(LEGACY_PLUGIN_DEVELOPER_INSTRUCTIONS)
+	) {
+		return "current";
+	}
+	if (
+		normalized === normalizeDeveloperInstructionsText(OMX_DEVELOPER_INSTRUCTIONS)
+	) {
+		return "historical";
+	}
+	return "custom";
+}
+
+function readRootDeveloperInstructions(config: string): unknown | undefined {
+	if (!rootHasTomlKey(config, "developer_instructions")) return undefined;
+	try {
+		const parsed = TOML.parse(config) as Record<string, unknown>;
+		return parsed.developer_instructions;
+	} catch {
+		return Symbol.for("omx.invalid-developer-instructions");
+	}
+}
+
+async function askYesNoDefaultYes(question: string): Promise<boolean> {
 	if (!process.stdin.isTTY || !process.stdout.isTTY) {
 		return false;
 	}
@@ -882,41 +1016,119 @@ async function promptForPluginDeveloperInstructionsDefault(
 		output: process.stdout,
 	});
 	try {
-		const answer = (
-			await rl.question(
-				`Plugin mode: add OMX developer_instructions defaults to "${configPath}"? [y/N]: `,
-			)
-		)
-			.trim()
-			.toLowerCase();
-		return answer === "y" || answer === "yes";
+		const answer = (await rl.question(question)).trim().toLowerCase();
+		return answer === "" || answer === "y" || answer === "yes";
 	} finally {
 		rl.close();
 	}
 }
 
-async function promptForPluginDeveloperInstructionsOverwrite(
+function legacyPluginDeveloperInstructionsDecision(
+	choice: boolean | "skip" | "preserve-or-add" | "refresh",
+	state: PluginDeveloperInstructionsDecision["state"] = "missing",
+): PluginDeveloperInstructionsDecision {
+	if (choice === "refresh" || (choice === true && state === "historical")) {
+		return {
+			action: "update",
+			state: "historical",
+			reason:
+				choice === "refresh"
+					? "legacy explicit refresh policy"
+					: "legacy boolean approval refreshed historical developer_instructions",
+		};
+	}
+	if (choice === true || choice === "preserve-or-add") {
+		return {
+			action: "add",
+			state: "missing",
+			reason: "legacy explicit add-if-missing policy",
+		};
+	}
+	return {
+		action: "preserve",
+		state,
+		reason: "legacy explicit skip policy",
+	};
+}
+
+async function resolvePluginDeveloperInstructionsDecision(
 	configPath: string,
-): Promise<boolean> {
-	if (!process.stdin.isTTY || !process.stdout.isTTY) {
-		return false;
+	options: Pick<SetupOptions, "pluginDeveloperInstructionsPrompt">,
+): Promise<PluginDeveloperInstructionsDecision> {
+	const existing = existsSync(configPath)
+		? await readFile(configPath, "utf-8")
+		: "";
+	const value = readRootDeveloperInstructions(existing);
+	if (value === undefined) {
+		if (options.pluginDeveloperInstructionsPrompt) {
+			return legacyPluginDeveloperInstructionsDecision(
+				await options.pluginDeveloperInstructionsPrompt(configPath),
+				"missing",
+			);
+		}
+		const install = await askYesNoDefaultYes(
+			`Plugin mode: add OMX developer_instructions bootstrap to "${configPath}"? [Y/n]: `,
+		);
+		return install
+			? {
+					action: "add",
+					state: "missing",
+					reason: "missing developer_instructions",
+				}
+			: {
+					action: "preserve",
+					state: "missing",
+					reason: "missing developer_instructions skipped",
+				};
 	}
-	const rl = createInterface({
-		input: process.stdin,
-		output: process.stdout,
-	});
-	try {
-		const answer = (
-			await rl.question(
-				`Plugin mode: overwrite existing developer_instructions in "${configPath}" with OMX defaults? [y/N]: `,
-			)
-		)
-			.trim()
-			.toLowerCase();
-		return answer === "y" || answer === "yes";
-	} finally {
-		rl.close();
+
+	const state = classifyPluginDeveloperInstructions(value);
+	if (state === "current") {
+		return {
+			action: "preserve",
+			state,
+			reason: "current OMX developer_instructions already installed",
+		};
 	}
+
+	if (state === "historical") {
+		const updateDecision = options.pluginDeveloperInstructionsPrompt
+			? legacyPluginDeveloperInstructionsDecision(
+					await options.pluginDeveloperInstructionsPrompt(configPath),
+					state,
+				)
+			: await askYesNoDefaultYes(
+					`Plugin mode: update OMX developer_instructions bootstrap at "${configPath}"? [Y/n]: `,
+				)
+				? {
+						action: "update",
+						state,
+						reason: "recognized historical OMX developer_instructions",
+					} satisfies PluginDeveloperInstructionsDecision
+				: {
+						action: "preserve",
+						state,
+						reason: "historical OMX developer_instructions preserved",
+					} satisfies PluginDeveloperInstructionsDecision;
+		const update = updateDecision.action === "update";
+		return update
+			? {
+					action: "update",
+					state,
+					reason: "recognized historical OMX developer_instructions",
+				}
+			: {
+					action: "preserve",
+					state,
+					reason: "historical OMX developer_instructions preserved",
+				};
+	}
+
+	return {
+		action: "preserve",
+		state: "custom",
+		reason: "custom or unknown developer_instructions preserved",
+	};
 }
 
 async function resolveSetupScope(
@@ -1115,6 +1327,8 @@ async function refreshOmxPluginDiscoveryCache(
 			!skillListChanged
 		) continue;
 
+
+
 		staleDirs.push(cacheDir);
 		if (!options.dryRun) {
 			await rm(cacheDir, { recursive: true, force: true });
@@ -1190,9 +1404,13 @@ async function resolveSetupInstallMode(
 		return { installMode: persisted.installMode, source: "persisted" };
 	}
 
-	if (scope !== "user") return null;
-
 	const discoveredPluginCacheDir = await discoverOmxPluginCacheDir();
+	if (scope !== "user") {
+		return discoveredPluginCacheDir
+			? { installMode: "plugin", source: "default" }
+			: null;
+	}
+
 	const defaultMode =
 		persistedReviewDecision === "review" && persisted?.installMode
 			? persisted.installMode
@@ -1385,7 +1603,18 @@ async function cleanupPluginModeLegacyPrompts(
 	return summary;
 }
 
-function stripPluginModeLegacyRootDefaults(config: string): string {
+function removeRootTomlKey(config: string, key: string): string {
+	const range = findRootTomlKeyRange(config, key);
+	if (!range) return config;
+	const before = config.slice(0, range.start);
+	const after = config.slice(range.end).replace(/^\r?\n?/, "\n");
+	return `${before}${after}`;
+}
+
+function stripPluginModeLegacyRootDefaults(
+	config: string,
+	developerInstructionsDecision: PluginDeveloperInstructionsDecision,
+): string {
 	const lines = config.split(/\r?\n/);
 	const firstTableIndex = lines.findIndex((line) => /^\s*\[/.test(line));
 	const boundary = firstTableIndex >= 0 ? firstTableIndex : lines.length;
@@ -1412,17 +1641,20 @@ function stripPluginModeLegacyRootDefaults(config: string): string {
 		) {
 			continue;
 		}
-		if (
-			index < boundary &&
-			/^\s*developer_instructions\s*=/.test(line) &&
-			line.includes("You have oh-my-codex installed.")
-		) {
-			continue;
-		}
 		result.push(line);
 	}
 
-	return result.join("\n").replace(/\n{3,}/g, "\n\n");
+	let nextConfig = result.join("\n").replace(/\n{3,}/g, "\n\n");
+	if (
+		developerInstructionsDecision.action === "update" &&
+		developerInstructionsDecision.state === "historical" &&
+		classifyPluginDeveloperInstructions(
+			readRootDeveloperInstructions(nextConfig),
+		) === "historical"
+	) {
+		nextConfig = removeRootTomlKey(nextConfig, "developer_instructions");
+	}
+	return nextConfig;
 }
 
 function rootHasTomlKey(config: string, key: string): boolean {
@@ -1435,20 +1667,67 @@ function rootHasTomlKey(config: string, key: string): boolean {
 }
 
 function replaceRootTomlKey(config: string, key: string, line: string): string {
-	const lines = config.trimEnd().split(/\r?\n/);
-	const firstTableIndex = lines.findIndex((entry) => /^\s*\[/.test(entry));
-	const boundary = firstTableIndex < 0 ? lines.length : firstTableIndex;
-	const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const pattern = new RegExp(`^\\s*${escapedKey}\\s*=`);
+	const range = findRootTomlKeyRange(config, key);
+	if (!range) return insertRootTomlKey(config, line);
+	const before = config.slice(0, range.start);
+	const after = config.slice(range.end).replace(/^\r?\n?/, "\n");
+	return `${before}${line}${after}`.replace(/\n?$/, "\n");
+}
 
-	for (let i = 0; i < boundary; i++) {
-		if (pattern.test(lines[i])) {
-			lines[i] = line;
-			return lines.join("\n") + "\n";
+function findRootTomlKeyRange(
+	config: string,
+	key: string,
+): { start: number; end: number } | null {
+	const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const keyPattern = new RegExp(`^\\s*${escapedKey}\\s*=`);
+	const nextRootKeyPattern = /^\s*[A-Za-z0-9_-]+\s*=/;
+	const tablePattern = /^\s*\[/;
+	const linePattern = /.*(?:\r?\n|$)/g;
+	let match: RegExpExecArray | null;
+	let found: { start: number; end: number } | null = null;
+	let inMultiline = false;
+	let multilineDelimiter: '"""' | "'''" | null = null;
+
+	while ((match = linePattern.exec(config)) && match[0] !== "") {
+		const line = match[0];
+		const lineStart = match.index;
+		const lineEnd = lineStart + line.length;
+		const trimmedLine = line.replace(/\r?\n$/, "");
+
+		if (!found) {
+			if (tablePattern.test(trimmedLine)) return null;
+			if (keyPattern.test(trimmedLine)) {
+				found = { start: lineStart, end: lineEnd };
+				const valuePart = trimmedLine.slice(trimmedLine.indexOf("=") + 1);
+				const delimiter = valuePart.includes('"""')
+					? '"""'
+					: valuePart.includes("'''")
+						? "'''"
+						: null;
+				if (delimiter && valuePart.split(delimiter).length - 1 === 1) {
+					inMultiline = true;
+					multilineDelimiter = delimiter;
+				} else {
+					return found;
+				}
+			}
+			continue;
+		}
+
+		found.end = lineEnd;
+		if (inMultiline && multilineDelimiter) {
+			if (trimmedLine.includes(multilineDelimiter)) {
+				return found;
+			}
+			continue;
+		}
+		if (tablePattern.test(trimmedLine) || nextRootKeyPattern.test(trimmedLine)) {
+			found.end = lineStart;
+			return found;
 		}
 	}
 
-	return insertRootTomlKey(config, line);
+	return found;
 }
 
 function insertRootTomlKey(config: string, line: string): string {
@@ -1606,6 +1885,13 @@ async function applyPluginModeHooksConfig(
 	const existingHooksContent = existsSync(hooksPath)
 		? await readFile(hooksPath, "utf-8")
 		: null;
+	await migrateLegacyHooksJsonTrustStateToConfig(
+		configPath,
+		existingHooksContent,
+		backupContext,
+		summary,
+		options,
+	);
 	if (options.pluginScopedHooks) {
 		await cleanupPluginModeManagedHooksJson(
 			existingHooksContent,
@@ -1652,32 +1938,36 @@ async function applyPluginDeveloperInstructionsDefault(
 	configPath: string,
 	backupContext: SetupBackupContext,
 	summary: SetupCategorySummary,
-	options: Pick<
-		SetupOptions,
-		"dryRun" | "verbose" | "pluginDeveloperInstructionsOverwritePrompt"
-	>,
+	options: Pick<SetupOptions, "dryRun" | "verbose"> & {
+		decision: PluginDeveloperInstructionsDecision;
+	},
 ): Promise<"updated" | "exists" | "skipped"> {
 	const existing = existsSync(configPath)
 		? await readFile(configPath, "utf-8")
 		: "";
+	if (options.decision.action === "preserve") {
+		summary.skipped += 1;
+		if (options.verbose) {
+			console.log(
+				`  preserved plugin developer_instructions default: ${options.decision.reason}`,
+			);
+		}
+		return options.decision.state === "missing" ? "skipped" : "exists";
+	}
+
 	const line = `developer_instructions = ${JSON.stringify(OMX_PLUGIN_DEVELOPER_INSTRUCTIONS)}`;
 	const hasExistingDeveloperInstructions = rootHasTomlKey(
 		existing,
 		"developer_instructions",
 	);
-	if (hasExistingDeveloperInstructions) {
-		const overwrite = options.pluginDeveloperInstructionsOverwritePrompt
-			? await options.pluginDeveloperInstructionsOverwritePrompt(configPath)
-			: await promptForPluginDeveloperInstructionsOverwrite(configPath);
-		if (!overwrite) {
-			summary.skipped += 1;
-			if (options.verbose) {
-				console.log(
-					"  skipped plugin developer_instructions default: root developer_instructions already exists",
-				);
-			}
-			return "exists";
+	if (hasExistingDeveloperInstructions && options.decision.action === "add") {
+		summary.skipped += 1;
+		if (options.verbose) {
+			console.log(
+				"  skipped plugin developer_instructions default: root developer_instructions already exists",
+			);
 		}
+		return "exists";
 	}
 
 	const nextConfig = hasExistingDeveloperInstructions
@@ -1707,6 +1997,7 @@ async function cleanupPluginModeLegacyConfig(
 	backupContext: SetupBackupContext,
 	options: Pick<SetupOptions, "dryRun" | "verbose"> & {
 		preserveFirstPartyMcp?: boolean;
+		developerInstructionsDecision: PluginDeveloperInstructionsDecision;
 	},
 ): Promise<boolean> {
 	if (!existsSync(configPath)) return false;
@@ -1719,9 +2010,12 @@ async function cleanupPluginModeLegacyConfig(
 	config = stripFirstPartyOmxMcpSections(config);
 	config = stripExistingOmxBlocks(config).cleaned;
 	config = stripExistingSharedMcpRegistryBlock(config).cleaned;
-	config = stripPluginModeLegacyRootDefaults(config);
+	config = stripPluginModeLegacyRootDefaults(
+		config,
+		options.developerInstructionsDecision,
+	);
 	config = stripOmxSeededBehavioralDefaults(config);
-	config = stripOmxFeatureFlags(config);
+	config = stripOmxFeatureFlags(config, { preserveMultiAgent: true });
 	config = stripManagedCodexHookTrustState(config);
 	config = stripOmxEnvSettings(config);
 	if (preservedFirstPartyMcp) {
@@ -1750,39 +2044,6 @@ async function cleanupPluginModeLegacyConfig(
 	return true;
 }
 
-async function cleanupPluginModeLegacyAgentsMd(
-	agentsMdPath: string,
-	backupContext: SetupBackupContext,
-	options: Pick<SetupOptions, "dryRun" | "verbose">,
-): Promise<boolean> {
-	if (!existsSync(agentsMdPath)) return false;
-	const fileInfo = await lstat(agentsMdPath);
-	if (fileInfo.isSymbolicLink()) {
-		if (options.verbose) {
-			console.log(
-				`  preserved symlinked AGENTS.md at ${agentsMdPath}; plugin mode only removes direct legacy OMX-generated files`,
-			);
-		}
-		return false;
-	}
-
-	const content = await readFile(agentsMdPath, "utf-8");
-	if (!isOmxGeneratedAgentsMd(content)) return false;
-
-	if (await ensureBackup(agentsMdPath, true, backupContext, options)) {
-		// backup created for pre-existing AGENTS.md
-	}
-	if (!options.dryRun) {
-		await rm(agentsMdPath, { force: true });
-	}
-	if (options.verbose) {
-		console.log(
-			`  ${options.dryRun ? "would remove" : "removed"} legacy OMX-generated AGENTS.md`,
-		);
-	}
-	return true;
-}
-
 export async function setup(options: SetupOptions = {}): Promise<void> {
 	const {
 		force = false,
@@ -1792,13 +2053,13 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		teamMode: requestedTeamMode,
 		scope: requestedScope,
 		verbose = false,
+		skipNativeAgentRefresh: requestedSkipNativeAgentRefresh = false,
 		setupScopePrompt,
 		persistedSetupReviewPrompt,
 		installModePrompt,
 		modelUpgradePrompt,
 		pluginAgentsMdPrompt,
 		pluginDeveloperInstructionsPrompt,
-		pluginDeveloperInstructionsOverwritePrompt,
 		firstPartyMcpRemovalPrompt,
 	} = options;
 	const pkgRoot = getPackageRoot();
@@ -1871,6 +2132,9 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		)
 		?? "enabled";
 	const isTeamModeEnabled = teamModeEnabled(resolvedTeamMode);
+	const skipNativeAgentRefresh =
+		requestedSkipNativeAgentRefresh ||
+		process.env[SKIP_NATIVE_AGENT_REFRESH_ENV] === "1";
 	const scopeDirs = resolveScopeDirectories(resolvedScope.scope, projectRoot);
 	const existingConfigForMcpMigration = existsSync(scopeDirs.codexConfigFile)
 		? await readFile(scopeDirs.codexConfigFile, "utf-8")
@@ -1911,17 +2175,35 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		resolvedScope.scope === "project"
 			? join(projectRoot, "AGENTS.md")
 			: join(scopeDirs.codexHomeDir, "AGENTS.md");
-	const usePluginDeveloperInstructionsDefault = isPluginInstallMode
-		? pluginDeveloperInstructionsPrompt
-			? await pluginDeveloperInstructionsPrompt(scopeDirs.codexConfigFile)
-			: await promptForPluginDeveloperInstructionsDefault(
+	const pluginDeveloperInstructionsDecision: PluginDeveloperInstructionsDecision =
+		isPluginInstallMode
+			? await resolvePluginDeveloperInstructionsDecision(
 					scopeDirs.codexConfigFile,
+					{ pluginDeveloperInstructionsPrompt },
 				)
-		: false;
+			: {
+					action: "preserve",
+					state: "custom",
+					reason: "non-plugin setup mode",
+				};
+	let pluginAgentsMdPathExists = false;
+	let pluginAgentsMdIsSymlink = false;
+	try {
+		const pluginAgentsMdStat = await lstat(pluginAgentsMdDst);
+		pluginAgentsMdPathExists = true;
+		pluginAgentsMdIsSymlink = pluginAgentsMdStat.isSymbolicLink();
+	} catch {
+		pluginAgentsMdPathExists = false;
+		pluginAgentsMdIsSymlink = false;
+	}
 	const usePluginAgentsMdDefault = isPluginInstallMode
-		? pluginAgentsMdPrompt
-			? await pluginAgentsMdPrompt(pluginAgentsMdDst)
-			: await promptForPluginAgentsMdDefault(pluginAgentsMdDst)
+		? options.mergeAgents || pluginAgentsMdIsSymlink
+			? false
+			: force
+				? true
+				: pluginAgentsMdPrompt
+					? await pluginAgentsMdPrompt(pluginAgentsMdDst)
+					: await promptForPluginAgentsMdDefault(pluginAgentsMdDst)
 		: false;
 
 	console.log("oh-my-codex setup");
@@ -2127,7 +2409,12 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 
 	// Step 4: Install native agent configs
 	console.log("[4/8] Installing native agent configs...");
-	if (isPluginInstallMode) {
+	if (skipNativeAgentRefresh) {
+		summary.nativeAgents = createEmptyCategorySummary();
+		console.log(
+			"  Native agent refresh skipped for background update-check setup refresh.\n",
+		);
+	} else if (isPluginInstallMode) {
 		summary.nativeAgents = await refreshNativeAgentConfigs(
 			pkgRoot,
 			scopeDirs.nativeAgentsDir,
@@ -2216,6 +2503,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				preserveFirstPartyMcp:
 					shouldOfferFirstPartyMcpRemoval &&
 					!removeFirstPartyMcpRegistrations,
+				developerInstructionsDecision: pluginDeveloperInstructionsDecision,
 			},
 		);
 		if (configCleaned) summary.config.removed += 1;
@@ -2271,9 +2559,11 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			scopeDirs.codexHomeDir,
 		);
 		if (pluginCacheRefresh.status === "refreshed") {
-			console.log(
-				`  ${dryRun ? "Would invalidate" : "Invalidated"} ${pluginCacheRefresh.staleDirs.length} stale Codex plugin discovery cache entr${pluginCacheRefresh.staleDirs.length === 1 ? "y" : "ies"} so plugin skills refresh from the packaged manifest.`,
-			);
+			if (pluginCacheRefresh.staleDirs.length > 0) {
+				console.log(
+					`  ${dryRun ? "Would invalidate" : "Invalidated"} ${pluginCacheRefresh.staleDirs.length} stale Codex plugin discovery cache entr${pluginCacheRefresh.staleDirs.length === 1 ? "y" : "ies"} so plugin skills refresh from the packaged manifest.`,
+				);
+			}
 		} else if (pluginCacheRefresh.status === "unchanged") {
 			console.log("  Codex plugin discovery cache already matches packaged plugin metadata.");
 		}
@@ -2288,6 +2578,9 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			);
 		} else if (pluginCacheMaterialize.status === "unchanged") {
 			console.log("  Local Codex plugin cache already exposes packaged OMX skills.");
+		}
+		if (pluginCacheMaterialize.status === "materialized" || pluginCacheMaterialize.status === "unchanged") {
+			console.log("  Start a new Codex session if /skills still shows stale OMX plugin skill metadata; the current session may keep its in-memory plugin registry until restart.");
 		}
 		if (shouldSyncSharedMcpRegistry) {
 			resolvedConfig = await syncSharedMcpRegistryIntoConfig(
@@ -2315,7 +2608,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				: `  Native Codex hooks fallback and runtime feature flags refresh complete (${scopeDirs.codexHooksFile}; hooks, goals).\n`,
 		);
 
-		if (usePluginDeveloperInstructionsDefault) {
+		if (pluginDeveloperInstructionsDecision.action !== "preserve") {
 			const developerInstructionsResult =
 				await applyPluginDeveloperInstructionsDefault(
 					scopeDirs.codexConfigFile,
@@ -2324,7 +2617,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 					{
 						dryRun,
 						verbose,
-						pluginDeveloperInstructionsOverwritePrompt,
+						decision: pluginDeveloperInstructionsDecision,
 					},
 				);
 			if (developerInstructionsResult === "updated") {
@@ -2341,7 +2634,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			}
 		} else {
 			console.log(
-				"  Plugin-mode developer_instructions default not selected.\n",
+				`  Plugin-mode developer_instructions default preserved (${pluginDeveloperInstructionsDecision.reason}).\n`,
 			);
 		}
 	} else {
@@ -2389,6 +2682,13 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		const existingHooksContent = existsSync(scopeDirs.codexHooksFile)
 			? await readFile(scopeDirs.codexHooksFile, "utf-8")
 			: null;
+		await migrateLegacyHooksJsonTrustStateToConfig(
+			scopeDirs.codexConfigFile,
+			existingHooksContent,
+			backupContext,
+			summary.config,
+			{ dryRun, verbose },
+		);
 		const hooksConfig = mergeManagedCodexHooksConfig(
 			existingHooksContent,
 			pkgRoot,
@@ -2432,57 +2732,125 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 
 	// Step 6: Generate AGENTS.md
 	console.log("[6/8] Generating AGENTS.md...");
+	const activeSession =
+		resolvedScope.scope === "project"
+			? await readSessionState(projectRoot)
+			: null;
+	const sessionIsActive = activeSession && !isSessionStale(activeSession);
 	if (isPluginInstallMode) {
-		const agentsMdRemoved = await cleanupPluginModeLegacyAgentsMd(
-			pluginAgentsMdDst,
-			backupContext,
-			{ dryRun, verbose },
-		);
-		if (agentsMdRemoved) {
-			summary.agentsMd.removed += 1;
-			console.log(
-				`  ${dryRun ? "Would remove" : "Removed"} legacy OMX-generated AGENTS.md for plugin mode.\n`,
+		const agentsMdSrc = join(pkgRoot, "templates", "AGENTS.md");
+		const pluginAgentsMdExists = pluginAgentsMdPathExists;
+		if (existsSync(agentsMdSrc)) {
+			const content = await readFile(agentsMdSrc, "utf-8");
+			const modelTableContext = resolveAgentsModelTableContext(
+				resolvedConfig,
+				{
+					codexHomeOverride: scopeDirs.codexHomeDir,
+				},
 			);
-		}
-
-		if (usePluginAgentsMdDefault) {
-			const agentsMdSrc = join(pkgRoot, "templates", "AGENTS.md");
-			if (existsSync(agentsMdSrc)) {
-				const content = await readFile(agentsMdSrc, "utf-8");
-				const modelTableContext = resolveAgentsModelTableContext(
-					resolvedConfig,
-					{
-						codexHomeOverride: scopeDirs.codexHomeDir,
-					},
-				);
-				const modelTableDefinitions =
-					getAgentsModelTableDefinitionsForTeamMode(resolvedTeamMode);
-				const rewritten = upsertAgentsModelTable(
-					addGeneratedAgentsMarker(
-						applyTeamModeToAgentsTemplate(
-							applyPluginModeWordingToAgentsTemplate(
-								content,
-								resolvedScope.scope,
-							),
-							resolvedTeamMode,
+			const modelTableDefinitions =
+				getAgentsModelTableDefinitionsForTeamMode(resolvedTeamMode);
+			const rewritten = upsertAgentsModelTable(
+				addGeneratedAgentsMarker(
+					applyTeamModeToAgentsTemplate(
+						applyPluginModeWordingToAgentsTemplate(
+							content,
+							resolvedScope.scope,
 						),
+						resolvedTeamMode,
 					),
-					modelTableContext,
-					modelTableDefinitions,
-				);
-				const result = await syncManagedAgentsContent(
-					rewritten,
-					pluginAgentsMdDst,
-					summary.agentsMd,
-					backupContext,
-					{
-						agentsOverwritePrompt: options.agentsOverwritePrompt,
-						dryRun,
-						force,
-						verbose,
-					},
-				);
-				if (result === "updated") {
+				),
+				modelTableContext,
+				modelTableDefinitions,
+				{ codexHomeOverride: scopeDirs.codexHomeDir },
+			);
+			if (options.mergeAgents && pluginAgentsMdExists) {
+				if (pluginAgentsMdIsSymlink) {
+					summary.agentsMd.skipped += 1;
+					console.log(
+						`  Skipped plugin-mode AGENTS.md merge for symlinked ${pluginAgentsMdDst}; existing AGENTS.md left untouched.`,
+					);
+				} else {
+					const existing = await readFile(pluginAgentsMdDst, "utf-8");
+					const mergedAgentsContent = upsertManagedAgentsBlock(existing, rewritten);
+					const canApplyManagedAgentsMerge = mergedAgentsContent !== existing;
+					if (
+						resolvedScope.scope === "project" &&
+						sessionIsActive &&
+						canApplyManagedAgentsMerge
+					) {
+						summary.agentsMd.skipped += 1;
+						console.log(
+							"  WARNING: Active omx session detected (pid " +
+								activeSession?.pid +
+								").",
+						);
+						console.log(
+							"  Skipping AGENTS.md overwrite to avoid corrupting runtime overlay.",
+						);
+						console.log("  Stop the active session first, then re-run setup.");
+					} else if (!canApplyManagedAgentsMerge) {
+						summary.agentsMd.unchanged += 1;
+						console.log(
+							resolvedScope.scope === "project"
+								? "  Plugin-mode AGENTS.md already up to date in project root."
+								: `  Plugin-mode AGENTS.md already up to date in ${scopeDirs.codexHomeDir}.`,
+						);
+					} else {
+						await syncManagedContent(
+							mergedAgentsContent,
+							pluginAgentsMdDst,
+							summary.agentsMd,
+							backupContext,
+							{ dryRun, verbose },
+							`plugin AGENTS merge ${pluginAgentsMdDst}`,
+						);
+						console.log(
+							resolvedScope.scope === "project"
+								? "  Merged plugin-mode OMX-managed AGENTS.md sections into project root."
+								: `  Merged plugin-mode OMX-managed AGENTS.md sections into ${scopeDirs.codexHomeDir}.`,
+						);
+					}
+				}
+			} else if (usePluginAgentsMdDefault) {
+				const existingPluginAgentsMd = pluginAgentsMdExists
+					? await readFile(pluginAgentsMdDst, "utf-8")
+					: "";
+				const pluginAgentsMdContent = pluginAgentsMdExists
+					? preserveUserOmxPolicyBlocks(existingPluginAgentsMd, rewritten)
+					: rewritten;
+				const defaultWouldChange = pluginAgentsMdExists
+					? existingPluginAgentsMd !== pluginAgentsMdContent
+					: true;
+				if (
+					resolvedScope.scope === "project" &&
+					sessionIsActive &&
+					defaultWouldChange
+				) {
+					summary.agentsMd.skipped += 1;
+					console.log(
+						"  WARNING: Active omx session detected (pid " +
+							activeSession?.pid +
+							").",
+					);
+					console.log(
+						"  Skipping AGENTS.md overwrite to avoid corrupting runtime overlay.",
+					);
+					console.log("  Stop the active session first, then re-run setup.");
+				} else {
+					const result = await syncManagedAgentsContent(
+						pluginAgentsMdContent,
+						pluginAgentsMdDst,
+						summary.agentsMd,
+						backupContext,
+						{
+							agentsOverwritePrompt: options.agentsOverwritePrompt,
+							dryRun,
+							force,
+							verbose,
+						},
+					);
+					if (result === "updated") {
 					console.log(
 						resolvedScope.scope === "project"
 							? "  Generated plugin-mode AGENTS.md defaults in project root."
@@ -2494,22 +2862,23 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 							? "  Plugin-mode AGENTS.md defaults already up to date in project root."
 							: `  Plugin-mode AGENTS.md defaults already up to date in ${scopeDirs.codexHomeDir}.`,
 					);
-				} else {
-					console.log(
-						`  Skipped plugin-mode AGENTS.md defaults for ${pluginAgentsMdDst}.`,
-					);
+					} else {
+						console.log(
+							`  Skipped plugin-mode AGENTS.md defaults for ${pluginAgentsMdDst}.`,
+						);
+					}
 				}
 			} else {
 				summary.agentsMd.skipped += 1;
-				console.log("  AGENTS.md template not found, skipping.");
+				console.log(
+					pluginAgentsMdExists
+						? "  Plugin-mode AGENTS.md defaults not selected; existing AGENTS.md left untouched.\n"
+						: "  Plugin-mode AGENTS.md defaults not selected; no AGENTS.md was generated.\n",
+				);
 			}
 		} else {
 			summary.agentsMd.skipped += 1;
-			console.log(
-				agentsMdRemoved
-					? "  Plugin-mode AGENTS.md defaults not selected.\n"
-					: "  AGENTS.md generation skipped; no legacy OMX-generated AGENTS.md found and defaults not selected.\n",
-			);
+			console.log("  AGENTS.md template not found, skipping.");
 		}
 	} else {
 		const agentsMdSrc = join(pkgRoot, "templates", "AGENTS.md");
@@ -2520,12 +2889,6 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		const agentsMdExists = existsSync(agentsMdDst);
 
 		// Guard: refuse to overwrite project-root AGENTS.md during active session
-		const activeSession =
-			resolvedScope.scope === "project"
-				? await readSessionState(projectRoot)
-				: null;
-		const sessionIsActive = activeSession && !isSessionStale(activeSession);
-
 		if (existsSync(agentsMdSrc)) {
 			const content = await readFile(agentsMdSrc, "utf-8");
 			const modelTableContext = resolveAgentsModelTableContext(resolvedConfig, {
@@ -2542,6 +2905,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				),
 				modelTableContext,
 				modelTableDefinitions,
+				{ codexHomeOverride: scopeDirs.codexHomeDir },
 			);
 			let changed = true;
 			let canApplyManagedModelRefresh = false;
@@ -2570,10 +2934,11 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 						const existingIsGeneratedAgentsMd = isOmxGeneratedAgentsMd(existing);
 						managedRefreshContent = teamModeEnabled(resolvedTeamMode)
 							? upsertAgentsModelTable(
-									existing,
-									modelTableContext,
-									modelTableDefinitions,
-								)
+								existing,
+								modelTableContext,
+								modelTableDefinitions,
+								{ codexHomeOverride: scopeDirs.codexHomeDir },
+							)
 							: existingIsGeneratedAgentsMd
 								? rewritten
 								: upsertManagedAgentsBlock(existing, rewritten);
@@ -2743,7 +3108,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		);
 		console.log("  3. Browse plugin-provided skills with /skills");
 		console.log(
-			"  4. Optional AGENTS.md and developer_instructions defaults are only installed when selected during plugin-mode setup",
+			"  4. Plugin-mode AGENTS.md defaults provide persistent orchestration guidance; developer_instructions is an optional bootstrap",
 		);
 		console.log(
 			"  5. Native agent role TOML files written to .codex/agents/ for agent_type routing",
@@ -2759,7 +3124,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			"  4. The AGENTS.md orchestration brain is loaded automatically",
 		);
 		console.log(
-			"  5. Native agent defaults configured in config.toml [agents] and TOML files written to .codex/agents/",
+			"  5. Native agent role TOML files written to .codex/agents/; use explicit agent_type when spawning OMX roles",
 		);
 	}
 	console.log(
@@ -2888,6 +3253,144 @@ async function syncManagedContent(
 	if (!options.dryRun) {
 		await mkdir(dirname(dstPath), { recursive: true });
 		await writeFile(dstPath, content);
+	}
+
+	summary.updated += 1;
+	if (options.verbose) {
+		console.log(
+			`  ${options.dryRun ? "would update" : "updated"} ${verboseLabel}`,
+		);
+	}
+}
+
+interface NativeAgentInstallManifestEntry {
+	sha256: string;
+}
+
+interface NativeAgentInstallManifest {
+	version: 1;
+	files: Record<string, NativeAgentInstallManifestEntry>;
+}
+
+function hashContent(content: string): string {
+	return createHash("sha256").update(content).digest("hex");
+}
+
+function nativeAgentInstallManifestPath(agentsDir: string): string {
+	return join(agentsDir, "..", ".omx", "native-agents.json");
+}
+
+async function readNativeAgentInstallManifest(
+	agentsDir: string,
+): Promise<NativeAgentInstallManifest> {
+	const manifestPath = nativeAgentInstallManifestPath(agentsDir);
+	if (!existsSync(manifestPath)) return { version: 1, files: {} };
+
+	try {
+		const parsed = JSON.parse(await readFile(manifestPath, "utf-8")) as {
+			version?: unknown;
+			files?: unknown;
+		};
+		if (
+			parsed.version !== 1 ||
+			!parsed.files ||
+			typeof parsed.files !== "object"
+		) {
+			return { version: 1, files: {} };
+		}
+
+		const files: Record<string, NativeAgentInstallManifestEntry> = {};
+		for (const [fileName, entry] of Object.entries(
+			parsed.files as Record<string, unknown>,
+		)) {
+			if (!fileName.endsWith(".toml")) continue;
+			if (!entry || typeof entry !== "object") continue;
+			const sha256 = (entry as { sha256?: unknown }).sha256;
+			if (typeof sha256 === "string" && /^[0-9a-f]{64}$/i.test(sha256)) {
+				files[fileName] = { sha256: sha256.toLowerCase() };
+			}
+		}
+		return { version: 1, files };
+	} catch {
+		return { version: 1, files: {} };
+	}
+}
+
+async function writeNativeAgentInstallManifest(
+	agentsDir: string,
+	manifest: NativeAgentInstallManifest,
+): Promise<void> {
+	const manifestPath = nativeAgentInstallManifestPath(agentsDir);
+	await mkdir(dirname(manifestPath), { recursive: true });
+	const sortedFiles = Object.fromEntries(
+		Object.entries(manifest.files).sort(([left], [right]) =>
+			left.localeCompare(right),
+		),
+	);
+	await writeFile(
+		manifestPath,
+		JSON.stringify({ version: 1, files: sortedFiles }, null, 2) + "\n",
+	);
+}
+
+async function syncNativeAgentToml(
+	content: string,
+	dstPath: string,
+	summary: SetupCategorySummary,
+	backupContext: SetupBackupContext,
+	options: Pick<SetupOptions, "dryRun" | "verbose" | "force">,
+	verboseLabel: string,
+	manifest: NativeAgentInstallManifest,
+): Promise<void> {
+	const fileName = basename(dstPath);
+	const nextHash = hashContent(content);
+	const destinationExists = existsSync(dstPath);
+
+	if (!destinationExists) {
+		if (!options.dryRun) {
+			await mkdir(dirname(dstPath), { recursive: true });
+			await writeFile(dstPath, content);
+			manifest.files[fileName] = { sha256: nextHash };
+		}
+		summary.updated += 1;
+		if (options.verbose) {
+			console.log(
+				`  ${options.dryRun ? "would update" : "updated"} ${verboseLabel}`,
+			);
+		}
+		return;
+	}
+
+	const existing = await readFile(dstPath, "utf-8");
+	const existingHash = hashContent(existing);
+	if (existing === content) {
+		if (!options.dryRun) {
+			manifest.files[fileName] = { sha256: nextHash };
+		}
+		summary.unchanged += 1;
+		return;
+	}
+
+	const priorHash = manifest.files[fileName]?.sha256;
+	const safeToOverwrite = options.force || priorHash === existingHash;
+	if (!safeToOverwrite) {
+		summary.skipped += 1;
+		if (options.verbose) {
+			console.log(
+				`  skipped ${verboseLabel} (local modifications preserved; use --force to overwrite)`,
+			);
+		}
+		return;
+	}
+
+	if (await ensureBackup(dstPath, true, backupContext, options)) {
+		summary.backedUp += 1;
+	}
+
+	if (!options.dryRun) {
+		await mkdir(dirname(dstPath), { recursive: true });
+		await writeFile(dstPath, content);
+		manifest.files[fileName] = { sha256: nextHash };
 	}
 
 	summary.updated += 1;
@@ -3162,6 +3665,7 @@ async function refreshNativeAgentConfigs(
 		await mkdir(agentsDir, { recursive: true });
 	}
 
+	const nativeAgentManifest = await readNativeAgentInstallManifest(agentsDir);
 	const manifest = tryReadCatalogManifest();
 	const agentStatusByName = manifest
 		? getCatalogAgentStatusByName(manifest)
@@ -3202,13 +3706,14 @@ async function refreshNativeAgentConfigs(
 			codexHomeOverride: join(agentsDir, ".."),
 		});
 		const dst = join(agentsDir, `${name}.toml`);
-		await syncManagedContent(
+		await syncNativeAgentToml(
 			toml,
 			dst,
 			summary,
 			backupContext,
 			options,
 			`native agent ${name}.toml`,
+			nativeAgentManifest,
 		);
 	}
 
@@ -3252,6 +3757,7 @@ async function refreshNativeAgentConfigs(
 			}
 			if (!options.dryRun) {
 				await rm(staleAgentPath, { force: true });
+				delete nativeAgentManifest.files[file];
 			}
 			summary.removed += 1;
 			if (options.verbose) {
@@ -3263,6 +3769,10 @@ async function refreshNativeAgentConfigs(
 				console.log(`  ${prefix} ${file} (status: ${label}${reason})`);
 			}
 		}
+	}
+
+	if (!options.dryRun) {
+		await writeNativeAgentInstallManifest(agentsDir, nativeAgentManifest);
 	}
 
 	return summary;
@@ -3664,7 +4174,7 @@ async function updateManagedConfig(
 	let modelOverride: string | undefined;
 	const omxManagesTui = true;
 
-	if (currentModel === LEGACY_SETUP_MODEL) {
+	if (currentModel && LEGACY_SETUP_MODELS.has(currentModel)) {
 		const shouldPrompt =
 			typeof options.modelUpgradePrompt === "function" ||
 			(process.stdin.isTTY && process.stdout.isTTY);

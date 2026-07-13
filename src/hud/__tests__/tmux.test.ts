@@ -106,7 +106,7 @@ describe('HUD resize hook helpers', () => {
     assert.match(calls[3]?.[4] ?? '', /TMUX/);
     assert.match(calls[3]?.[4] ?? '', /TMUX_PANE/);
     assert.match(calls[3]?.[4] ?? '', /OMX_TMUX_HUD_OWNER/);
-    assert.match(calls[3]?.[4] ?? '', /wait-for/);
+    assert.doesNotMatch(calls[3]?.[4] ?? '', /wait-for/);
   });
 
   it('reports partial failure but keeps the resize hook when layout-change hook install fails', () => {
@@ -415,10 +415,10 @@ describe('HUD pane ownership helpers', () => {
         `%5\tnode\texec env OMX_SESSION_ID='sess-b' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' /node /omx.js hud --watch`,
       ].join('\n'),
     );
-
+    
     assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'sess-a', leaderPaneId: '%1' }), ['%2', '%4']);
     assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'sess-a', leaderPaneId: '%3' }), ['%3', '%4']);
-    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { leaderPaneId: '%1' }), []);
+    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { leaderPaneId: '%1' }), ['%2', '%5']);
   });
 
   it('does not match session-owned HUD panes when only leader ownership is requested', () => {
@@ -430,7 +430,7 @@ describe('HUD pane ownership helpers', () => {
       ].join('\n'),
     );
 
-    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { leaderPaneId: '%1' }), []);
+    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { leaderPaneId: '%1' }), ['%2', '%3']);
   });
 
   it('does not match leader-only legacy HUD panes when a session owner is requested', () => {
@@ -592,6 +592,28 @@ describe('HUD pane ownership helpers', () => {
 });
 
 describe('dead HUD pane reaper', () => {
+  it('ignores team ACK commands that mention HUD preserve repro text', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex',
+        [
+          '%2',
+          'node',
+          "node /repo/dist/cli/omx.js team api send-message --input '{\"body\":\"ACK: hud preserve repro just ack\"}' --json",
+        ].join('\t'),
+      ].join('\n'),
+    );
+
+    const result = reapDeadHudPanes(panes, {
+      killPane: () => {
+        throw new Error('team ACK command should not be classified as a HUD watch pane');
+      },
+    });
+
+    assert.deepEqual(findHudWatchPaneIds(panes), []);
+    assert.deepEqual(result, { reaped: [], preserved: [] });
+  });
+
   it('kills HUD panes whose leader pane is not present in the snapshot', () => {
     const panes = parseTmuxPaneSnapshot(
       [

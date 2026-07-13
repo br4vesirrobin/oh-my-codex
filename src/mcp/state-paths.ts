@@ -226,32 +226,26 @@ function enforceWorkingDirectoryPolicy(resolvedWorkingDirectory: string): string
   return canonicalWorkingDirectory;
 }
 
-function resolveBaseStateDirWithSource(workingDirectory?: string): { baseStateDir: string; rootSource: StateRootSource } {
+export function getBaseStateDirWithSource(workingDirectory?: string): { baseStateDir: string; rootSource: StateRootSource } {
   const teamStateRootOverride = process.env[OMX_TEAM_STATE_ROOT_ENV]?.trim();
   if (typeof teamStateRootOverride === 'string' && teamStateRootOverride !== '') {
-    try {
-      return { baseStateDir: resolveWorkingDirectoryForState(teamStateRootOverride), rootSource: 'team-env' };
-    } catch {}
+    return { baseStateDir: resolveWorkingDirectoryForState(teamStateRootOverride), rootSource: 'team-env' };
   }
 
   const omxRootOverride = process.env[OMX_ROOT_ENV]?.trim();
   if (typeof omxRootOverride === 'string' && omxRootOverride !== '') {
-    try {
-      return { baseStateDir: join(resolveWorkingDirectoryForState(omxRootOverride), '.omx', 'state'), rootSource: 'omx-root-env' };
-    } catch {}
+    return { baseStateDir: join(resolveWorkingDirectoryForState(omxRootOverride), '.omx', 'state'), rootSource: 'omx-root-env' };
   }
 
   const omxStateRootOverride = process.env[OMX_STATE_ROOT_ENV]?.trim();
   if (typeof omxStateRootOverride === 'string' && omxStateRootOverride !== '') {
-    try {
-      return { baseStateDir: join(resolveWorkingDirectoryForState(omxStateRootOverride), '.omx', 'state'), rootSource: 'omx-state-root-env' };
-    } catch {}
+    return { baseStateDir: join(resolveWorkingDirectoryForState(omxStateRootOverride), '.omx', 'state'), rootSource: 'omx-state-root-env' };
   }
 
   return { baseStateDir: join(resolveWorkingDirectoryForState(workingDirectory), '.omx', 'state'), rootSource: 'cwd-default' };
 }
 export function getBaseStateDir(workingDirectory?: string): string {
-  return resolveBaseStateDirWithSource(workingDirectory).baseStateDir;
+  return getBaseStateDirWithSource(workingDirectory).baseStateDir;
 }
 
 export function getStateDir(workingDirectory?: string, sessionId?: string): string {
@@ -288,7 +282,10 @@ function readSessionIdFromEnvironment(env: NodeJS.ProcessEnv = process.env): str
 
 function resolveCanonicalSessionId(candidate: string | undefined, metadata: ResolvedSessionMetadata | undefined): string | undefined {
   if (!candidate) return undefined;
-  return metadata?.nativeSessionAliases.includes(candidate) ? metadata.sessionId : candidate;
+  if (!metadata) return candidate;
+  return metadata.nativeSessionAliases.includes(candidate) || metadata.ownerOmxSessionId === candidate
+    ? metadata.sessionId
+    : candidate;
 }
 
 async function readUsableSessionStateFromBaseStateDir(
@@ -396,7 +393,7 @@ export async function resolveRuntimeStateScope(
   explicitSessionId?: string,
 ): Promise<ResolvedRuntimeStateScope> {
   const cwd = resolveWorkingDirectoryForState(workingDirectory);
-  const { baseStateDir, rootSource } = resolveBaseStateDirWithSource(cwd);
+  const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
   const metadata = await readSessionMetadataFromBaseStateDir(cwd, baseStateDir);
   const validatedExplicit = validateSessionId(explicitSessionId);
   const envSessionId = readSessionIdFromEnvironment();
@@ -404,11 +401,13 @@ export async function resolveRuntimeStateScope(
   let source: SessionScopeSource = 'root';
 
   if (validatedExplicit) {
-    sessionId = metadata?.nativeSessionAliases.includes(validatedExplicit) ? metadata.sessionId : validatedExplicit;
-    source = metadata?.nativeSessionAliases.includes(validatedExplicit) ? 'native-alias' : 'explicit';
+    const canonicalSessionId = resolveCanonicalSessionId(validatedExplicit, metadata);
+    sessionId = canonicalSessionId ?? validatedExplicit;
+    source = metadata && canonicalSessionId === metadata.sessionId && validatedExplicit !== metadata.sessionId ? 'native-alias' : 'explicit';
   } else if (envSessionId) {
-    sessionId = metadata?.nativeSessionAliases.includes(envSessionId) ? metadata.sessionId : envSessionId;
-    source = metadata?.nativeSessionAliases.includes(envSessionId) ? 'native-alias' : 'env';
+    const canonicalSessionId = resolveCanonicalSessionId(envSessionId, metadata);
+    sessionId = canonicalSessionId ?? envSessionId;
+    source = metadata && canonicalSessionId === metadata.sessionId && envSessionId !== metadata.sessionId ? 'native-alias' : 'env';
   } else if (metadata?.sessionId) {
     sessionId = metadata.sessionId;
     source = 'session-json';

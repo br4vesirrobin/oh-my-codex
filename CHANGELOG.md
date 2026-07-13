@@ -4,6 +4,284 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+
+## [0.20.1] - 2026-07-12
+
+Patch release for the reliability fixes in `v0.20.0..9eadab9f191103177fb3eac1b237188ada1f503c`. No intentional breaking CLI or package-layout changes.
+
+### Fixed
+
+- **CRLF AGENTS markers** — generated `AGENTS.md` marker insertion preserves CRLF line endings (#3107).
+- **Ralplan drafts** — the native planning-write boundary permits normalized direct-child Markdown artifacts under `.omx/drafts/` while retaining its fail-closed protections (#3110).
+- **Fresh configuration ownership** — setup no longer seeds legacy multi-agent or context-window defaults, preserving user-owned configuration and native role routing (#3111, #3115).
+- **Stop hook protocol** — Stop responses no longer emit unsupported top-level fields and remain schema-safe (#3114).
+- **Delegated child provenance** — the Conductor guard accepts trusted delegated collaboration children while continuing to protect leader and planning-boundary cases (#3117; issue #3116).
+- **Native delegation and Bash targets** — native delegation detection distinguishes incomplete capability inventories, and quoted Bash argument values no longer masquerade as write redirects (#3120; issue #3119).
+
+### Release collateral
+
+- `f644d2cd3ae98587942aa94f0030f083ea0bb10f` and `5d43a5bf6f008de17f9425bee4495c457c60b96a` are prior-release documentation corrections carried forward from 0.20.0 collateral; they are not 0.20.1 product-fix headlines.
+
+### PRs
+
+- #3107, #3110, #3111, #3114, #3115, #3117, #3120. Issues #3116 and #3119 are associated issues, not additional PRs.
+
+### Verification
+
+- Pre-tag requirements, evidence schema, and pending external evidence are declared in `docs/qa/release-readiness-0.20.1.md`; this changelog records no test, CI, tag, or publication result.
+## [0.20.0] - 2026-07-10
+
+Minor release migrating the entire model contract to OpenAI's GPT-5.6 generation (publicly released 2026-07-09), plus the accumulated dev-branch fixes and features merged since `0.19.1`.
+
+### Added
+
+- **Capabilities lockfile preflight** — new `omx capabilities lock`/`check` CLI providing a manual capabilities-lockfile preflight (#3087).
+- **GPT-5.6 model aliases** — `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6-sol` recognized as known Codex model aliases (#3104).
+- **Canonical worktree tool context** — shared CodeGraph/worktree tool-context resolution (#3102).
+- **Persisted subagents reopen on SessionStart** (#3099).
+
+### Changed
+
+- **Model contract migrated to GPT-5.6 (Sol/Terra/Luna)** — frontier default `gpt-5.5` -> `gpt-5.6-sol`, standard `gpt-5.4-mini` -> `gpt-5.6-terra`, spark `gpt-5.3-codex-spark` -> `gpt-5.6-luna` across runtime defaults, agent definitions, Rust crates (sparkshell/explore/api), docs, prompts, skills, plugin mirror, and test fixtures.
+- **Role allocation on the new lanes** — planner/architect pinned to exact `gpt-5.6-sol` (medium/xhigh reasoning), researcher pinned to exact `gpt-5.6-terra`; standard worker/review roles use `gpt-5.6-terra`; fast/low-complexity roles and team low-complexity workers use `gpt-5.6-luna`.
+- **Exact-model composition seam retargeted** — `EXACT_GPT_5_4_MINI_MODEL` renamed to `EXACT_GPT_5_6_TERRA_MODEL`; guidance keys off the trimmed final resolved model with exact case-sensitive equality and now takes precedence over role `exactModel` pins.
+- **Setup legacy upgrade set widened** — setup offers prompt-gated upgrades from both `gpt-5.3-codex` and `gpt-5.5` to `gpt-5.6-sol`; declined and non-interactive runs preserve the existing model.
+- **Autopilot cheap-lane classifier** — canonical `gpt-5.6-terra` and `gpt-5.6-luna` are classified as cheap ahead of the generic heuristic, so Terra mains route heavy planning to the dedicated planner.
+- **Project setup defaults to plugin mode with plugin cache** (#3085); plugin hooks are gated to omx-launched sessions (#3086); resume plugin preflight is opt-in (#3088).
+
+### Fixed
+
+- **Team delegation child-model fallback** resolves through `getTeamChildModel()` (honors `OMX_TEAM_CHILD_MODEL`) instead of a hardcoded seam constant.
+- **Doctor Spark source labeling** reports `.omx-config.json env` and `.omx-config.json models.team_low_complexity` accurately instead of misattributing sources.
+- **Conductor deadlock without native subagents prevented** (#3079); resume `--sort updated` preserves transcript mtimes (#3080); plugin Stop hook accepts last-line JSON after launcher noise (#3082).
+- **Deep-interview state hardening** — runtime state allowlist (#3091) and terminal-state normalization (#3092).
+- **Ralplan/Ultragoal handoff fixes** — approval handoff and lane reuse (#3094), ralplan-handoff goal derivation guard (#3097), structured ultragoal steering cleanup (#3100).
+
+### PRs
+
+- #3079, #3080, #3082, #3085, #3086, #3087, #3088, #3091, #3092, #3094, #3097, #3099, #3100, #3102, #3104
+
+## [0.19.1] - 2026-07-08
+
+Patch release after `0.19.0` focused on Ultragoal/Ralplan terminal-state reliability, direct Team state roots, mission queue execution, and dependency hygiene.
+
+### Added
+
+- Mission queue runner MVP (#3063).
+
+### Fixed
+
+- Repair Ultragoal conductor provenance and task-scoped aggregate completion state (#3074, #3072).
+- Handle invalid mission summary JSON (#3070).
+- Fix Ralplan terminalization tracker lag and terminal Stop cache loops (#3068, #3058).
+- Fix state roots for direct Team state directory usage (#3062).
+
+### Changed
+
+- Refresh @types/node to 26.1.0 and @biomejs/biome to 2.5.2 (#3065, #3066).
+- Avoid stale catalog counts in the contributing guide (#3069).
+
+### PRs
+
+- #3058, #3062, #3063, #3065, #3066, #3068, #3069, #3070, #3072, #3074
+
+### Verification
+
+- Dev CI is green for `59a9cb80`; release workflow evidence is appended after tag publication.
+
+
+## [0.19.0] - 2026-07-04
+
+Reliability and safety-hardening train after `0.18.17`: planning-gate and handoff-artifact execution transports are locked down, the conductor contract and typed subagent/lane provenance are hardened, Ralplan consensus/terminal-state handling is tightened, madmax worktree and resume paths are fixed, and a long-standing parallel-test flake in the Rust suite is eliminated. The CLI/package/plugin contract is preserved.
+
+### Changed
+
+- **Planning and handoff execution transports are locked down** — `.omx/tmp` planning artifacts, same-command handoff artifact scripts, and planning-guard Python/read-only-Bash writes can no longer be used as execution transports, while legitimate deep-interview→ralplan artifact handoff is still allowed.
+- **Conductor and typed-lane contracts are hardened** — conductor contract, typed subagent provenance, typed-lane fences, shell-guard target parsing, and the conductor reuse ledger reduce unsafe or ambiguous delegation.
+
+### Fixed
+
+- **Test flakiness eliminated** — the Rust sparkshell test helper `unique_temp_dir()` now uses a per-process monotonic counter so parallel same-process tests can no longer collide on a shared temp state root, fixing intermittent `json_mode_reports_failed_worker_status` failures.
+- **Ralplan consensus and terminal state are safer** — consensus review evidence, terminal closeout state writes, and heredoc redirect scanning are hardened against stale or unsafe writes.
+- **Autopilot and madmax paths are sturdier** — Autopilot ralplan handoff, madmax worktree runtime roots, and madmax resume plugin cache preflight are corrected.
+- **HUD Ultragoal status is accurate** — superseded Ultragoal goals render correctly in the HUD.
+
+### PRs
+
+- #3056, #3055, #3054, #3051, #3050, #3048, #3047, #3046, #3045, #3042, #3040, #3038, #3037, #3035, #3032, #3031, #3030, #3025, #3022, #3018
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.19.0.md`.
+
+## [0.18.17] - 2026-07-01
+
+Patch release for the post-`0.18.16` runtime reliability train: Ultragoal null-goal recovery, MSYS/Windows Team startup handling, Ralplan terminal state, planning-gate write guards, and profile mention fallback behavior are tightened while preserving the existing CLI/package contract.
+
+### Changed
+
+- **Planning and conductor guardrails are stricter** — planning-gate state-write guards and exact-role worker routing reduce stale or unsafe planning writes in long-running workflows.
+- **Windows and MSYS workflow handling is sturdier** — psmux question rendering and Team worker startup paths are fixed for Windows/MSYS environments.
+
+### Fixed
+
+- **Ultragoal null-goal loops recover cleanly** — repeated `get_goal` null-result loops now have recovery behavior instead of leaving sessions stuck.
+- **Ralplan terminal session state is safer** — Ralplan terminal state handling avoids stale or mismatched continuation state.
+- **Stop keyword and profile mention edge cases are quieter** — path false positives and Discord mention fallback behavior are corrected.
+
+### PRs
+
+- #3020, #3017, #3015, #3014, #3012, #3011, #3009, #3008, #3006, #3004, #3003, #3000, #2999, #2998, #2997, #2996, #2991, #2990, #2989, #2987, #2986, #2985, #2982, #2981, #2979
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.17.md`.
+
+## [0.18.16] - 2026-06-27
+
+Patch release for the post-`0.18.15` diagnostics and stale-state hardening train: local session friction reporting is available, stale HUD/Ralph continuation state is guarded, and doctor artifact ownership warnings are safer.
+
+### Changed
+
+- **Local session friction reporting is available** — `omx session friction` can surface local run/session friction signals so resume and debugging workflows have more actionable history.
+
+### Fixed
+
+- **Stale HUD and Ralph continuation state is guarded** — HUD review status and Ralph Stop continuation handling avoid carrying stale review/stop signals across later workflow phases.
+- **Doctor artifact ownership diagnostics are safer** — `omx doctor` detects root-owned repository artifacts more clearly without over-warning on normal local files.
+
+### PRs
+
+- #2975, #2973, #2972, #2970
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.16.md`.
+
+## [0.18.15] - 2026-06-25
+
+Patch release for the post-`0.18.14` goal/runtime reliability train: completed-goal cleanup, state-path handling, guided autoresearch intake, MCP parity coverage, and native-hook resilience were tightened before the `0.18.16` follow-up train.
+
+### Fixed
+
+- **Goal and hook cleanup is sturdier** — completed-goal cleanup and native-hook handling are hardened for follow-up workflow runs.
+- **State path and autoresearch coverage is broader** — MCP state-path tests and guided autoresearch intake checks protect the release train.
+
+### Verification
+
+- `v0.18.15` was published from commit `e9e3bcc7` and superseded by the `0.18.16` release train.
+
+## [0.18.14] - 2026-06-20
+
+Patch release for the post-`0.18.13` reliability train: agent/model routing diagnostics are clearer, goal/planning workflows are safer, plugin and native-hook behavior is sturdier, HUD/Team/tmux edge cases are tightened, doctor catches root-owned repo artifacts, and resume search discovers madmax run histories.
+
+### Changed
+
+- **Agent/model routing is more transparent** — per-agent model overrides and launch diagnostics expose selected roles, tiers, and launch arguments without changing the default CLI/package contract.
+- **Goal and planning workflow guidance is clearer** — completed Codex goal cleanup, Ralplan transition diagnostics, supervised Autopilot review rework, Beads metadata handling, and goal/skill docs reduce stale or ambiguous handoffs.
+- **Doctor and resume discovery cover more local cases** — root-owned repo artifact detection and madmax run-history discovery improve troubleshooting and continuation.
+
+### Fixed
+
+- **Plugin, setup, and native hooks are safer** — plugin AGENTS policy blocks survive setup, dev plugin cache diagnostics are clearer, bundled skill agent tier references are present, native hooks succeed on null output, PreToolUse stdout/schema behavior is preserved, and Windows native hook command launching avoids shell wrapping.
+- **HUD, Team, and tmux behavior is sturdier** — stale Autopilot HUD state, cramped guard rendering, standalone pane-scoped HUD state, paste-buffer cleanup, worker AGENTS guidance, and HUD pane ownership on shutdown are hardened.
+- **Ralplan and Autopilot gates are fresher** — Ralplan consensus approval/freshness checks, guard/HUD phase authority, stale Autopilot stop state, and Ultragoal architecture invariant handling are tightened.
+
+### PRs
+
+- #2912, #2906, #2905, #2900, #2899, #2897, #2896, #2895, #2894, #2889, #2888, #2884, #2879, #2878, #2877, #2875, #2874, #2873, #2861, #2859, #2852, #2850, #2848, #2828
+
+### Issues
+
+- Held open PRs #2902, #2856, #2840, #2839, and #2838 are excluded from this release candidate unless already in `origin/dev`; prep confirmed they are open and `BEHIND` on base `dev`.
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.14.md`.
+
+## [0.18.13] - 2026-06-17
+
+Patch release for the post-`0.18.12` reliability train: project-scoped resume/search discovery is broader, setup and hook handling are safer, ralplan/autopilot consensus gates are fresher, CI/release infrastructure is sturdier, sidecar Team state roots align with runtime behavior, geobench documentation/schema fixes are captured, and release prep selects `0.18.13` rather than `0.19.0` after explicit no-breaking-change review.
+
+### Changed
+
+- **Project resume/search discovery is more complete** — project-scoped runtime Codex homes are included in `omx resume` and `omx session search`, with `--project` and `--codex-home` escape hatches documented for narrower or explicit lookup.
+- **CI and release infrastructure is sturdier** — workflows move to GitHub-hosted runners where appropriate, dev-merge issue-close follow-up comments are best-effort, and the `0.18.12` promotion topology is accounted for before preparing `0.18.13`.
+- **Geobench visibility is documented** — the curated geobench profile, visibility spec, romanization schema, and enriched profile schema are captured for repeatable benchmark configuration.
+
+### Fixed
+
+- **Setup, hooks, and transcript preservation are safer** — generated native-agent TOMLs preserve user customization, setup overwrite behavior is covered, hook JSON state compatibility is hardened, and project Codex transcripts survive cleanup.
+- **Ralplan and Autopilot gates are fresher** — consensus freshness checks, tracker-backed native reviews, target-aware write detection, and Autopilot ralplan handoff validation are tightened.
+- **Team sidecar state roots align with runtime behavior** — sidecar collection uses the Team runtime state root, reducing mismatched state inspection.
+
+### PRs
+
+- #2816, #2817, #2820, #2821, #2824, #2826, #2829, #2831, #2832, #2833, #2836, #2843, #2845, #2846
+
+### Issues
+
+- No open GitHub issues were present at release-scope review time; open PRs #2840, #2839, #2838, and draft #2828 were scoped as fix/docs/warning/safety follow-ups and did not change the `0.18.13` patch decision.
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.13.md`.
+
+## [0.18.12] - 2026-06-12
+
+Patch release for the post-`0.18.11` release-prep train: first-party MCP sibling detection is narrower, manual npm publishing is documented in CI, runtime/HUD/plugin/autopilot safeguards are tightened, Windows hook and state-input paths are safer, and release prep reconciles the main workflow history for `0.18.12`.
+
+### Changed
+
+- **Release and publication workflow is clearer** — manual npm publication workflow support and npm auth configuration are captured, while `0.18.12` release prep reconciles the main workflow history without tagging, merging main, or publishing locally.
+- **Runtime and automation gates are stricter** — Autopilot final gates, best-practice-research read-only boundaries, ralplan consensus guards, and deep-interview patch artifact handling are hardened.
+- **Plugin and generated guidance handling is safer** — persistent AGENTS guidance, plugin agent merge repair, developer-instruction prompt policy, setup plugin mode inference, and cleanup preservation are tightened.
+
+### Fixed
+
+- **Windows and CLI state paths are safer** — Windows hook shims preserve `Path`, emit `omx.cmd`, use absolute PowerShell hook paths, handle UTF-8 BOM for non-ASCII installs, and `omx state` gains a Windows-safe input surface.
+- **HUD/session visibility is more reliable** — dev version labels, stale HUD cleanup, HUD owner matching, terminal skill-active visibility, cancel hook-visible run-dir state, and detached history pruning tolerate more edge cases.
+- **MCP sibling detection is narrower** — post-traffic first-party MCP sibling capping avoids overmatching unrelated same-parent processes.
+
+### PRs
+
+- #2760, #2762, #2765, #2766, #2768, #2771, #2773, #2774, #2776, #2798, #2800, #2801, #2802, #2805, #2806, #2810, #2812
+
+### Issues
+
+- No open GitHub issues or open PRs were present at release prep time; release scope is represented by the merged PR and direct-commit inventory in the release notes.
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.12.md`.
+
+
+## [0.18.11] - 2026-06-09
+
+Patch release for the post-`0.18.10` cleanup train: the `omx explore` command surface is hard-deprecated, `omx doctor` gains Spark/model lane routing diagnostics, launch-time tmux HUD splitting is safer in cramped windows, and the catalog registers the wiki skill manifest entry.
+
+### Changed
+
+- **`omx explore` command surface is hard-deprecated** — the explore command surface is fully retired and remaining `omx explore` mentions are removed from global AGENTS guidance.
+- **Catalog gains the wiki skill manifest entry** — the wiki skill manifest entry is registered so the skill is discoverable through the standard manifest surface.
+
+### Fixed
+
+- **`omx doctor` surfaces Spark/model lane routing** — doctor adds a Spark/model lane routing diagnostic so misrouted model lanes are visible during diagnosis.
+- **Launch-time HUD is safer in cramped tmux windows** — the launch-time HUD split is skipped inside cramped existing tmux windows to avoid unusable pane splits during startup.
+
+### PRs
+
+- #2746, #2747, #2750, #2755, #2758
+
+### Issues
+
+- No separately closed GitHub issues were found for the `v0.18.10..HEAD` release range; the release scope is represented by the merged PR inventory above.
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.11.md`.
+
 ## [0.18.9] - 2026-06-03
 
 Patch release for the post-`0.18.8` update/runtime reliability train: stable/dev update channels, source-install packaging, Windows npm fallback, project-local runtime state lookup, cmux/tmux question rendering, deep-interview visibility/grounding, Autopilot/Ultragoal/review gate clarity, HUD pane scoping, and CI/release evidence hardening.

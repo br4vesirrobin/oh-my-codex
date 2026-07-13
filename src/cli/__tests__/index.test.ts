@@ -50,8 +50,10 @@ import {
   resolveOmxRootForLaunch,
   resolveDisposableWorktreeOmxRootForLaunch,
   prepareCodexHomeForLaunch,
+  captureMadmaxWorktreeRuntimeContext,
   persistProjectLaunchRuntimeAuthState,
   persistProjectLaunchRuntimeProjectTrustState,
+  cleanupRuntimeCodexHome,
   runtimeCodexHomePath,
   buildDetachedSessionBootstrapSteps,
   buildDetachedTmuxSessionName,
@@ -87,12 +89,13 @@ import {
   prependOmxRuntimeCommandShimToEnv,
   CODEX_SQLITE_HOME_ENV,
   DETACHED_TMUX_HISTORY_LIMIT,
+  isExistingTmuxWindowTooCrampedForLaunchHud,
 } from "../index.js";
 import { mergeConfig, repairConfigIfNeeded } from "../../config/generator.js";
 import { ensureReusableNodeModules } from "../../utils/repo-deps.js";
 import { readAllState } from "../../hud/state.js";
 import { generateOverlay } from "../../hooks/agents-overlay.js";
-import { HUD_TMUX_HEIGHT_LINES } from "../../hud/constants.js";
+import { HUD_TMUX_HEIGHT_LINES, HUD_TMUX_MIN_LAUNCH_WINDOW_HEIGHT_LINES } from "../../hud/constants.js";
 import { createHudWatchPane as createSharedHudWatchPane, listCurrentWindowHudPaneIds } from "../../hud/tmux.js";
 import {
   DEFAULT_FRONTIER_MODEL,
@@ -124,22 +127,150 @@ afterEach(() => {
 });
 
 describe("madmax state isolation", () => {
-  it("auto-isolates only madmax launch and exec invocations", () => {
+  it("auto-isolates madmax launch and exec invocations without boxing worktree-only launches", () => {
     assert.equal(shouldAutoIsolateMadmaxLaunch("launch", ["--madmax"], {}), true);
     assert.equal(shouldAutoIsolateMadmaxLaunch("exec", ["--madmax-spark"], {}), true);
+    assert.equal(shouldAutoIsolateMadmaxLaunch("launch", ["--worktree"], {}), false);
+    assert.equal(shouldAutoIsolateMadmaxLaunch("launch", ["-wfeature"], {}), false);
     assert.equal(shouldAutoIsolateMadmaxLaunch("team", ["--madmax"], {}), false);
     assert.equal(shouldAutoIsolateMadmaxLaunch("launch", ["--yolo"], {}), false);
+  });
+
+  it("does not let stale inherited madmax env suppress top-level isolation", () => {
     assert.equal(
-      shouldAutoIsolateMadmaxLaunch("launch", ["--madmax"], { OMX_ROOT: "/already/boxed" }),
-      false,
+      shouldAutoIsolateMadmaxLaunch("launch", ["--madmax"], { OMX_ROOT: "/already/boxed" }, "/repo"),
+      true,
     );
     assert.equal(
-      shouldAutoIsolateMadmaxLaunch("launch", ["--madmax"], { OMXBOX_ACTIVE: "1" }),
-      false,
+      shouldAutoIsolateMadmaxLaunch("launch", ["--madmax"], { OMXBOX_ACTIVE: "1" }, "/repo"),
+      true,
     );
     assert.equal(
-      shouldAutoIsolateMadmaxLaunch("launch", ["--madmax"], { OMX_NO_BOX: "1" }),
+      shouldAutoIsolateMadmaxLaunch(
+        "launch",
+        ["--madmax"],
+        { OMX_STATE_ROOT: "/already/boxed-state" },
+        "/repo",
+      ),
+      true,
+    );
+    assert.equal(
+      shouldAutoIsolateMadmaxLaunch(
+        "launch",
+        ["--worktree"],
+        {
+          OMXBOX_ACTIVE: "1",
+          OMX_ROOT: "/old/root",
+          OMX_MADMAX_DETACHED_CONTEXT: "old-context",
+        },
+        "/repo",
+      ),
       false,
+    );
+  });
+
+  it("preserves active boxed detached context reuse when only the context is inherited", () => {
+    assert.equal(
+      shouldAutoIsolateMadmaxLaunch(
+        "launch",
+        ["--madmax", "--tmux"],
+        {
+          OMXBOX_ACTIVE: "1",
+          OMX_MADMAX_DETACHED_CONTEXT: "boxed-context-under-test",
+        },
+        "/repo",
+      ),
+      false,
+    );
+  });
+
+  it("preserves matching detached madmax child context reuse", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-madmax-source-"));
+    const runs = await mkdtemp(join(tmpdir(), "omx-madmax-runs-"));
+    try {
+      const env: NodeJS.ProcessEnv = { OMX_RUNS_DIR: runs };
+      const runDir = createMadmaxIsolatedRoot(wd, ["--madmax", "--high"], env);
+      env.OMX_ROOT = runDir;
+      env.OMXBOX_ACTIVE = "1";
+
+      assert.equal(
+        shouldAutoIsolateMadmaxLaunch("launch", ["--madmax", "--high"], env, wd),
+        false,
+      );
+      assert.equal(
+        shouldAutoIsolateMadmaxLaunch("launch", ["--madmax", "--xhigh"], env, wd),
+        true,
+        "changed launch semantics must not reuse an inherited boxed root",
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(runs, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves explicit no-box behavior", () => {
+    assert.equal(
+      shouldAutoIsolateMadmaxLaunch("launch", ["--madmax"], { OMX_NO_BOX: "1" }, "/repo"),
+      false,
+    );
+  });
+
+  it("captures madmax worktree context from parsed worktree state, not remaining args", () => {
+    const sourceCwd = "/repo/source";
+    const worktreeCwd = "/repo/.worktrees/session";
+    const runDir = "/runs/run-issue-3043";
+    const context = captureMadmaxWorktreeRuntimeContext({
+      originalLaunchArgs: ["--madmax", "--worktree", "--version"],
+      worktreeEnabled: true,
+      sourceCwd,
+      worktreeCwd,
+      env: {
+        OMX_ROOT: runDir,
+        OMXBOX_ACTIVE: "1",
+        OMX_SOURCE_CWD: sourceCwd,
+        OMX_MADMAX_DETACHED_CONTEXT: "ctx-3043",
+      },
+    });
+
+    assert.deepEqual(context, {
+      omxRoot: runDir,
+      sourceCwd,
+      worktreeCwd,
+      madmaxDetachedContext: "ctx-3043",
+      boxedActive: true,
+    });
+  });
+
+  it("does not capture ordinary worktree or unboxed madmax launches", () => {
+    assert.equal(
+      captureMadmaxWorktreeRuntimeContext({
+        originalLaunchArgs: ["--worktree"],
+        worktreeEnabled: true,
+        sourceCwd: "/repo/source",
+        worktreeCwd: "/repo/.worktrees/session",
+        env: { OMX_ROOT: "/runs/run", OMXBOX_ACTIVE: "1" },
+      }),
+      undefined,
+    );
+    assert.equal(
+      captureMadmaxWorktreeRuntimeContext({
+        originalLaunchArgs: ["--madmax", "--worktree"],
+        worktreeEnabled: true,
+        sourceCwd: "/repo/source",
+        worktreeCwd: "/repo/.worktrees/session",
+        env: { OMX_ROOT: "/runs/run" },
+      }),
+      undefined,
+    );
+    assert.equal(
+      captureMadmaxWorktreeRuntimeContext({
+        originalLaunchArgs: ["--madmax", "--worktree"],
+        worktreeEnabled: false,
+        sourceCwd: "/repo/source",
+        worktreeCwd: "/repo/.worktrees/session",
+        env: { OMX_ROOT: "/runs/run", OMXBOX_ACTIVE: "1" },
+      }),
+      undefined,
     );
   });
 
@@ -456,6 +587,17 @@ describe("normalizeCodexLaunchArgs", () => {
       "-c",
       'model_reasoning_effort="xhigh"',
     ]);
+  });
+
+  it("rejects ambiguous max and ultra reasoning shorthands", () => {
+    assert.throws(
+      () => normalizeCodexLaunchArgs(["--max"]),
+      /canonical highest reasoning effort is "xhigh".*"max" and "ultra" are not accepted aliases/,
+    );
+    assert.throws(
+      () => normalizeCodexLaunchArgs(["--ultra"]),
+      /canonical highest reasoning effort is "xhigh".*"max" and "ultra" are not accepted aliases/,
+    );
   });
 
   it("maps --xhigh --madmax to codex-native flags only", () => {
@@ -889,6 +1031,47 @@ describe("cleanupPostLaunchModeStateFiles", () => {
       assert.deepEqual(sessionCanonical.active_skills, []);
     }
     assert.deepEqual(warnings, []);
+  });
+
+  it("normalizes stale terminal deep-interview locks during postLaunch cleanup", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-di-terminal-locks-"));
+    const sessionId = "sess-postlaunch-di-terminal-locks";
+    const sessionStateDir = join(wd, ".omx", "state", "sessions", sessionId);
+    const completedAt = "2026-07-09T00:00:00.000Z";
+
+    try {
+      await mkdir(sessionStateDir, { recursive: true });
+      await writeFile(
+        join(sessionStateDir, "deep-interview-state.json"),
+        JSON.stringify({
+          active: false,
+          mode: "deep-interview",
+          current_phase: "cancelled",
+          completed_at: completedAt,
+          input_lock: {
+            active: true,
+            owner: "stale-question",
+          },
+        }, null, 2),
+        "utf-8",
+      );
+
+      await cleanupPostLaunchModeStateFiles(wd, sessionId);
+
+      const deepInterview = JSON.parse(
+        await readFile(join(sessionStateDir, "deep-interview-state.json"), "utf-8"),
+      ) as Record<string, unknown>;
+      const inputLock = deepInterview.input_lock as Record<string, unknown>;
+
+      assert.equal(deepInterview.active, false);
+      assert.equal(deepInterview.current_phase, "cancelled");
+      assert.equal(deepInterview.completed_at, completedAt);
+      assert.equal(inputLock.active, false);
+      assert.equal(inputLock.status, "released");
+      assert.equal(inputLock.released_at, completedAt);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
   });
 
   it("does not preserve complete Ralph cleanup state without completion-audit evidence", async () => {
@@ -1550,6 +1733,7 @@ describe("resolveWorkerSparkModel", () => {
   });
 
   it("reads low-complexity team model from config when codexHomeOverride is provided", async () => {
+    // Intentional legacy model fixture: verifies an explicit user override is routed to workers unchanged.
     const codexHome = await mkdtemp(join(tmpdir(), "omx-codex-home-"));
     try {
       await writeFile(
@@ -1617,10 +1801,14 @@ describe("commandOwnsLocalHelp", () => {
       "explore",
       "hooks",
       "hud",
+      "notepad",
+      "project-memory",
       "ralph",
       "resume",
       "session",
       "sparkshell",
+      "trace",
+      "code-intel",
       "team",
       "tmux-hook",
     ]) {
@@ -2177,7 +2365,7 @@ describe("project launch scope helpers", () => {
         join(wd, ".omx", "setup-scope.json"),
         JSON.stringify({ scope: "project" }),
       );
-      await writeFile(join(projectCodexHome, "config.toml"), 'model = "gpt-5.5"\n');
+      await writeFile(join(projectCodexHome, "config.toml"), 'model = "gpt-5.6-sol"\n');
       await writeFile(join(projectCodexHome, "state_5.sqlite"), "state db placeholder");
       await writeFile(join(projectCodexHome, "state_5.sqlite-wal"), "state db wal placeholder");
       await writeFile(join(projectCodexHome, "logs_2.sqlite-shm"), "logs db shm placeholder");
@@ -2205,6 +2393,90 @@ describe("project launch scope helpers", () => {
     }
   });
 
+  it("creates durable project Codex transcript links for project launches", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-links-"));
+    try {
+      const projectCodexHome = join(wd, ".codex");
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "setup-scope.json"),
+        JSON.stringify({ scope: "project" }),
+      );
+
+      const prepared = await prepareCodexHomeForLaunch(wd, "session-history-links", {});
+      const runtimeCodexHome = runtimeCodexHomePath(wd, "session-history-links");
+
+      assert.equal(prepared.codexHomeOverride, runtimeCodexHome);
+      assert.equal((await lstat(join(runtimeCodexHome, "sessions"))).isSymbolicLink(), true);
+      assert.equal((await lstat(join(runtimeCodexHome, "history.jsonl"))).isSymbolicLink(), true);
+      assert.equal((await lstat(join(runtimeCodexHome, "session_index.jsonl"))).isSymbolicLink(), true);
+      await writeFile(
+        join(runtimeCodexHome, "sessions", "linked-rollout.jsonl"),
+        '{"type":"session_meta"}\n',
+      );
+      await writeFile(join(runtimeCodexHome, "history.jsonl"), '{"session_id":"linked"}\n');
+      await writeFile(join(runtimeCodexHome, "session_index.jsonl"), '{"id":"linked"}\n');
+
+      await cleanupRuntimeCodexHome(
+        prepared.runtimeCodexHomeForCleanup,
+        prepared.projectLocalCodexHomeForCleanup,
+      );
+
+      assert.equal(
+        await readFile(join(projectCodexHome, "sessions", "linked-rollout.jsonl"), "utf-8"),
+        '{"type":"session_meta"}\n',
+      );
+      assert.equal(await readFile(join(projectCodexHome, "history.jsonl"), "utf-8"), '{"session_id":"linked"}\n');
+      assert.equal(await readFile(join(projectCodexHome, "session_index.jsonl"), "utf-8"), '{"id":"linked"}\n');
+      assert.equal(existsSync(runtimeCodexHome), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("copies non-symlink runtime Codex transcript artifacts before cleanup", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-copyback-"));
+    try {
+      const projectCodexHome = join(wd, ".codex");
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await mkdir(projectCodexHome, { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "setup-scope.json"),
+        JSON.stringify({ scope: "project" }),
+      );
+
+      const prepared = await prepareCodexHomeForLaunch(wd, "session-history-copyback", {});
+      const runtimeCodexHome = runtimeCodexHomePath(wd, "session-history-copyback");
+      await rm(join(runtimeCodexHome, "sessions"), { recursive: true, force: true });
+      await rm(join(runtimeCodexHome, "history.jsonl"), { force: true });
+      await rm(join(runtimeCodexHome, "session_index.jsonl"), { force: true });
+      await mkdir(join(runtimeCodexHome, "sessions", "2026", "06", "16"), { recursive: true });
+      await writeFile(
+        join(runtimeCodexHome, "sessions", "2026", "06", "16", "rollout-session-2835.jsonl"),
+        '{"type":"session_meta","payload":{"id":"session-2835"}}\n',
+      );
+      await writeFile(join(runtimeCodexHome, "history.jsonl"), '{"session_id":"session-2835"}\n');
+      await writeFile(join(runtimeCodexHome, "session_index.jsonl"), '{"id":"session-2835"}\n');
+      await writeFile(join(runtimeCodexHome, "auth.json"), '{"token":"opaque"}\n');
+
+      await cleanupRuntimeCodexHome(
+        prepared.runtimeCodexHomeForCleanup,
+        prepared.projectLocalCodexHomeForCleanup,
+      );
+
+      assert.equal(
+        await readFile(join(projectCodexHome, "sessions", "2026", "06", "16", "rollout-session-2835.jsonl"), "utf-8"),
+        '{"type":"session_meta","payload":{"id":"session-2835"}}\n',
+      );
+      assert.equal(await readFile(join(projectCodexHome, "history.jsonl"), "utf-8"), '{"session_id":"session-2835"}\n');
+      assert.equal(await readFile(join(projectCodexHome, "session_index.jsonl"), "utf-8"), '{"id":"session-2835"}\n');
+      assert.equal(await readFile(join(projectCodexHome, "auth.json"), "utf-8"), '{"token":"opaque"}\n');
+      assert.equal(existsSync(runtimeCodexHome), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("uses a session-scoped CODEX_HOME mirror for project launch config writes", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-launch-runtime-codex-home-"));
     try {
@@ -2217,7 +2489,7 @@ describe("project launch scope helpers", () => {
         JSON.stringify({ scope: "project" }),
       );
       const originalConfig = [
-        'model = "gpt-5.5"',
+        'model = "gpt-5.6-sol"',
         "",
         "[tui]",
         'status_line = ["model-with-reasoning", "git-branch"]',
@@ -2253,7 +2525,7 @@ describe("project launch scope helpers", () => {
 
       await writeFile(
         join(runtimeCodexHome, "config.toml"),
-        `${originalConfig}\n[tui.model_availability_nux]\n"gpt-5.5" = 1\n`,
+        `${originalConfig}\n[tui.model_availability_nux]\n"gpt-5.6-sol" = 1\n`,
       );
 
       assert.equal(await readFile(configPath, "utf-8"), originalConfig);
@@ -2278,13 +2550,13 @@ describe("project launch scope helpers", () => {
         join(wd, ".omx", "setup-scope.json"),
         JSON.stringify({ scope: "project" }),
       );
-      await writeFile(join(projectCodexHome, "config.toml"), 'model = "gpt-5.5"\n');
+      await writeFile(join(projectCodexHome, "config.toml"), 'model = "gpt-5.6-sol"\n');
 
       const prepared = await prepareCodexHomeForLaunch(wd, "session-auth", {});
       const runtimeCodexHome = runtimeCodexHomePath(wd, "session-auth");
       const opaqueAuthState = JSON.stringify({ token: "opaque-test-token" });
       await writeFile(join(runtimeCodexHome, "auth.json"), opaqueAuthState);
-      await writeFile(join(runtimeCodexHome, "config.toml"), 'model = "gpt-5.5"\n[tui.model_availability_nux]\n"gpt-5.5" = 1\n');
+      await writeFile(join(runtimeCodexHome, "config.toml"), 'model = "gpt-5.6-sol"\n[tui.model_availability_nux]\n"gpt-5.6-sol" = 1\n');
 
       await persistProjectLaunchRuntimeAuthState(
         prepared.runtimeCodexHomeForCleanup,
@@ -2292,7 +2564,7 @@ describe("project launch scope helpers", () => {
       );
 
       assert.equal(await readFile(join(projectCodexHome, "auth.json"), "utf-8"), opaqueAuthState);
-      assert.equal(await readFile(join(projectCodexHome, "config.toml"), "utf-8"), 'model = "gpt-5.5"\n');
+      assert.equal(await readFile(join(projectCodexHome, "config.toml"), "utf-8"), 'model = "gpt-5.6-sol"\n');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -2309,7 +2581,7 @@ describe("project launch scope helpers", () => {
         JSON.stringify({ scope: "project" }),
       );
       const originalProjectConfig = [
-        'model = "gpt-5.5"',
+        'model = "gpt-5.6-sol"',
         "",
         "[features]",
         "hooks = true",
@@ -2346,7 +2618,7 @@ describe("project launch scope helpers", () => {
           'trust_level = "trusted"',
           "",
           "[tui.model_availability_nux]",
-          '"gpt-5.5" = 1',
+          '"gpt-5.6-sol" = 1',
           "",
         ].join("\n"),
       );
@@ -2446,7 +2718,7 @@ describe("project launch scope helpers", () => {
       await writeFile(
         projectConfigPath,
         [
-          'model = "gpt-5.5"',
+          'model = "gpt-5.6-sol"',
           "",
           "[features]",
           "hooks = true",
@@ -2560,7 +2832,7 @@ describe("project launch scope helpers", () => {
         join(source, ".omx", "setup-scope.json"),
         JSON.stringify({ scope: "project" }),
       );
-      await writeFile(join(projectCodexHome, "config.toml"), 'model = "gpt-5.5"\n');
+      await writeFile(join(projectCodexHome, "config.toml"), 'model = "gpt-5.6-sol"\n');
 
       const prepared = await prepareCodexHomeForLaunch(source, "session-boxed", {});
       const runtimeCodexHome = runtimeCodexHomePath(source, "session-boxed");
@@ -2571,7 +2843,7 @@ describe("project launch scope helpers", () => {
       );
       assert.equal(prepared.codexHomeOverride, runtimeCodexHome);
       assert.equal(prepared.runtimeCodexHomeForCleanup, runtimeCodexHome);
-      assert.equal(await readFile(join(runtimeCodexHome, "config.toml"), "utf-8"), 'model = "gpt-5.5"\n');
+      assert.equal(await readFile(join(runtimeCodexHome, "config.toml"), "utf-8"), 'model = "gpt-5.6-sol"\n');
     } finally {
       if (typeof prevOmxRoot === "string") process.env.OMX_ROOT = prevOmxRoot;
       else delete process.env.OMX_ROOT;
@@ -2611,7 +2883,7 @@ describe("project launch scope helpers", () => {
         join(wd, ".omx", "setup-scope.json"),
         JSON.stringify({ scope: "project" }),
       );
-      await writeFile(join(wd, ".codex", "config.toml"), 'model = "gpt-5.5"\n');
+      await writeFile(join(wd, ".codex", "config.toml"), 'model = "gpt-5.6-sol"\n');
 
       const prepared = await prepareCodexHomeForLaunch(wd, "session-explicit-sqlite", {
         [CODEX_SQLITE_HOME_ENV]: "/tmp/explicit-sqlite-home",
@@ -3091,6 +3363,34 @@ describe("detached tmux new-session sequencing", () => {
     ]);
   });
 
+  it("buildDetachedSessionBootstrapSteps forwards inherited leader model separately from worker launch args", () => {
+    const steps = buildDetachedSessionBootstrapSteps(
+      "omx-demo",
+      "/tmp/project",
+      "'env' 'OMX_SESSION_ID=sess-detached-managed' 'codex' '--model' 'gpt-5.6-terra'",
+      "'node' '/tmp/omx.js' 'hud' '--watch'",
+      "--dangerously-bypass-approvals-and-sandbox --model gpt-5.6-terra",
+      "/tmp/project/.codex",
+      null,
+      false,
+      "sess-detached-managed",
+      undefined,
+      undefined,
+      undefined,
+      process.env,
+      undefined,
+      undefined,
+      "gpt-5.6-terra",
+    );
+    const newSession = steps.find((step) => step.name === "new-session");
+    assert.ok(newSession);
+    assert.equal(
+      newSession!.args.includes("-e") &&
+        newSession!.args.some((arg) => arg === "OMX_TEAM_WORKER_INHERITED_MODEL=gpt-5.6-terra"),
+      true,
+    );
+  });
+
   it("buildDetachedSessionBootstrapSteps forwards CODEX_HOME override to detached tmux session", () => {
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",
@@ -3456,6 +3756,92 @@ exit 0
     }
   });
 
+  it("creates a Windows omx.cmd runtime shim with cmd batch content on win32", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-runtime-command-shim-win-"));
+    try {
+      const shimDir = ensureOmxRuntimeCommandShim(
+        cwd,
+        "C:\\repo\\dist\\cli\\omx.js",
+        "C:\\Program Files\\nodejs\\node.exe",
+        "win32",
+      );
+      const shimPath = omxRuntimeCommandShimPath(cwd, "win32");
+
+      assert.equal(shimDir, dirname(shimPath));
+      assert.equal(shimPath.endsWith("omx.cmd"), true);
+      assert.equal(existsSync(shimPath), true);
+      assert.equal(await readFile(shimPath, "utf-8"), [
+        "@echo off",
+        `"C:\\Program Files\\nodejs\\node.exe" "C:\\repo\\dist\\cli\\omx.js" %*`,
+        "",
+      ].join("\r\n"));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves an inherited Windows Path key when prepending the shim dir", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-runtime-command-shim-winpath-"));
+    try {
+      const env = prependOmxRuntimeCommandShimToEnv(
+        cwd,
+        { Path: "C:\\Windows\\System32;C:\\Windows" },
+        "C:\\repo\\dist\\cli\\omx.js",
+        "C:\\Program Files\\nodejs\\node.exe",
+        "win32",
+      );
+      const shimDir = dirname(omxRuntimeCommandShimPath(cwd, "win32"));
+
+      assert.equal(env.Path, `${shimDir};C:\\Windows\\System32;C:\\Windows`);
+      assert.equal(env.PATH, undefined);
+      assert.equal(env.OMX_ENTRY_PATH, "C:\\repo\\dist\\cli\\omx.js");
+      assert.equal(env.OMX_STARTUP_CWD, cwd);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("collapses duplicate Windows PATH/Path variants to a single Path key", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-runtime-command-shim-windup-"));
+    try {
+      const env = prependOmxRuntimeCommandShimToEnv(
+        cwd,
+        { PATH: "", Path: "C:\\Windows\\System32" },
+        "C:\\repo\\dist\\cli\\omx.js",
+        "C:\\Program Files\\nodejs\\node.exe",
+        "win32",
+      );
+      const shimDir = dirname(omxRuntimeCommandShimPath(cwd, "win32"));
+      const pathKeys = Object.keys(env).filter(
+        (key) => key.toLowerCase() === "path",
+      );
+
+      assert.deepEqual(pathKeys, ["Path"]);
+      assert.equal(env.Path, `${shimDir};C:\\Windows\\System32`);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("seeds a Windows Path entry from the shim dir when none is inherited", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-runtime-command-shim-winempty-"));
+    try {
+      const env = prependOmxRuntimeCommandShimToEnv(
+        cwd,
+        {},
+        "C:\\repo\\dist\\cli\\omx.js",
+        "C:\\Program Files\\nodejs\\node.exe",
+        "win32",
+      );
+      const shimDir = dirname(omxRuntimeCommandShimPath(cwd, "win32"));
+
+      assert.equal(env.Path, shimDir);
+      assert.equal(env.PATH, undefined);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("keeps detached tmux bootstrap bounded when no interactive parent env file is requested", () => {
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",
@@ -3504,10 +3890,10 @@ exit 0
 
   it("runCodex builds inside-tmux HUD command through explicit runtime-root resolver", async () => {
     const source = await readFile(join(repoRoot, 'src', 'cli', 'index.ts'), 'utf-8');
-    assert.match(source, /const hudRuntimeRoot = resolveHudRuntimeRootForLaunch\(cwd, process\.env\);/);
+    assert.match(source, /const hudRuntimeRoot: HudRuntimeRootForLaunch = runtimeContext\s*\? \{ omxRoot: runtimeContext\.omxRoot, rootSource: 'omx-root-env' \}\s*: resolveHudRuntimeRootForLaunch\(cwd, process\.env\);/);
     assert.match(
       source,
-      /const hudEnvArgs = Object\.entries\(buildHudRuntimeEnv\(\{\s*sessionId,\s*leaderPaneId: currentPaneId,\s*\.\.\.hudRuntimeRoot,\s*\}\)\.env\)\.map\(\(\[key, value\]\) => `\$\{key\}=\$\{value\}`\)/,
+      /const hudRuntimeEnv = \{\s*\.\.\.buildHudRuntimeEnv\(\{\s*sessionId,\s*leaderPaneId: currentPaneId,\s*\.\.\.hudRuntimeRoot,\s*\}\)\.env,\s*\.\.\.runtimeEnvOverlay,\s*\};\s*const hudEnvArgs = Object\.entries\(hudRuntimeEnv\)\.map\(\(\[key, value\]\) => `\$\{key\}=\$\{value\}`\)/,
     );
     assert.match(source, /if \(env\.OMX_TEAM_STATE_ROOT\?\.trim\(\)\) return 'team-env';\s*if \(env\.OMX_ROOT\?\.trim\(\) \|\| omxRootOverride\) return 'omx-root-env';\s*if \(env\.OMX_STATE_ROOT\?\.trim\(\)\) return 'omx-state-root-env';/);
     assert.match(
@@ -3520,7 +3906,7 @@ exit 0
     const source = await readFile(join(repoRoot, 'src', 'cli', 'index.ts'), 'utf-8');
     assert.match(
       source,
-      /registerInsideTmuxHudResizeHook\(\{\s*hudPaneId,\s*currentPaneId,\s*cwd,\s*sessionId,\s*omxRootOverride,\s*\}\)/,
+      /registerInsideTmuxHudResizeHook\(\{\s*hudPaneId,\s*currentPaneId,\s*cwd,\s*sessionId,\s*omxRootOverride,\s*baseEnv: runtimeHookEnv,\s*\}\)/,
     );
     assert.match(
       source,
@@ -4739,8 +5125,25 @@ exit 0
     assert.match(historyHook.args[3] || "", /^client-detached\[[0-9]+\]$/);
     assert.equal(
       historyHook.args[4],
-      "if-shell -F '#{==:#{session_attached},0}' 'clear-history -t %leader'",
+      `if-shell -F '#{==:#{session_attached},0}' 'run-shell -b "tmux clear-history -t %leader >/dev/null 2>&1 || true"'`,
     );
+  });
+
+  it("detached history prune hook tolerates a dead leader pane", () => {
+    const steps = buildDetachedSessionFinalizeSteps(
+      "omx-demo",
+      "%12",
+      "3",
+      true,
+      false,
+      true,
+      "%leader",
+    );
+    const historyHook = steps.find((step) => step.name === "register-detached-history-prune-hook");
+    assert.ok(historyHook);
+    const hookCommand = historyHook.args[4] || "";
+    assert.match(hookCommand, /run-shell -b/);
+    assert.match(hookCommand, />\/dev\/null 2>&1 \|\| true/);
   });
 
   it("buildDetachedSessionFinalizeSteps skips attach for Hermes MCP bridge launches", () => {
@@ -5176,8 +5579,8 @@ describe("team worker launch arg inheritance helpers", () => {
 
   it("collectInheritableTeamWorkerArgs supports --model=<value> syntax", () => {
     assert.deepEqual(
-      collectInheritableTeamWorkerArgs(["--model=gpt-5.3-codex"]),
-      ["--model", "gpt-5.3-codex"],
+      collectInheritableTeamWorkerArgs(["--model=gpt-5.6-terra"]),
+      ["--model", "gpt-5.6-terra"],
     );
   });
 
@@ -5190,9 +5593,9 @@ describe("team worker launch arg inheritance helpers", () => {
         "-c",
         'model_provider="cheapRouter"',
         "--model",
-        "gpt-5.5",
+        "gpt-5.6-sol",
       ]),
-      ["-c", 'model_provider="cheapRouter"', "--model", "gpt-5.5"],
+      ["-c", 'model_provider="cheapRouter"', "--model", "gpt-5.6-sol"],
     );
   });
 
@@ -5232,10 +5635,10 @@ describe("team worker launch arg inheritance helpers", () => {
     assert.equal(
       resolveTeamWorkerLaunchArgsEnv(
         "--no-alt-screen",
-        ["--model=gpt-5.3-codex"],
+        ["--model=gpt-5.6-terra"],
         true,
       ),
-      "--no-alt-screen --model gpt-5.3-codex",
+      "--no-alt-screen --model gpt-5.6-terra",
     );
   });
 
@@ -5374,5 +5777,39 @@ describe("upsertTopLevelTomlString", () => {
       updated,
       'model_reasoning_effort = "xhigh"\n[tui]\nstatus_line = []\n',
     );
+  });
+});
+
+describe("isExistingTmuxWindowTooCrampedForLaunchHud (#2754)", () => {
+  it("skips the launch-time HUD split for cramped existing tmux windows", () => {
+    // The reported repro: a 160x41 existing tmux window where forcing the HUD
+    // split dropped the Codex TUI to 38 rows and became unreadable.
+    assert.equal(isExistingTmuxWindowTooCrampedForLaunchHud(41), true);
+    assert.equal(isExistingTmuxWindowTooCrampedForLaunchHud(38), true);
+    assert.equal(
+      isExistingTmuxWindowTooCrampedForLaunchHud(HUD_TMUX_MIN_LAUNCH_WINDOW_HEIGHT_LINES - 1),
+      true,
+    );
+  });
+
+  it("keeps default HUD behavior for normal-height existing tmux windows", () => {
+    assert.equal(
+      isExistingTmuxWindowTooCrampedForLaunchHud(HUD_TMUX_MIN_LAUNCH_WINDOW_HEIGHT_LINES),
+      false,
+    );
+    assert.equal(isExistingTmuxWindowTooCrampedForLaunchHud(50), false);
+    assert.equal(isExistingTmuxWindowTooCrampedForLaunchHud(120), false);
+  });
+
+  it("creates the HUD when the window height is unknown or invalid", () => {
+    assert.equal(isExistingTmuxWindowTooCrampedForLaunchHud(null), false);
+    assert.equal(isExistingTmuxWindowTooCrampedForLaunchHud(undefined), false);
+    assert.equal(isExistingTmuxWindowTooCrampedForLaunchHud(0), false);
+    assert.equal(isExistingTmuxWindowTooCrampedForLaunchHud(Number.NaN), false);
+  });
+
+  it("honors an explicit minimum-height override", () => {
+    assert.equal(isExistingTmuxWindowTooCrampedForLaunchHud(41, 40), false);
+    assert.equal(isExistingTmuxWindowTooCrampedForLaunchHud(39, 40), true);
   });
 });

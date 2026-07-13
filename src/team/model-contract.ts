@@ -1,6 +1,7 @@
 import { getAgent } from '../agents/definitions.js';
 import {
   DEFAULT_SPARK_MODEL,
+  getAgentModelOverride,
   getAgentReasoningOverride,
   getMainDefaultModel,
   getSparkDefaultModel,
@@ -13,6 +14,7 @@ const MODEL_FLAG = '--model';
 const CONFIG_FLAG = '-c';
 const REASONING_KEY = 'model_reasoning_effort';
 const MODEL_PROVIDER_KEY = 'model_provider';
+export const TEAM_WORKER_INHERITED_MODEL_ENV = 'OMX_TEAM_WORKER_INHERITED_MODEL';
 
 const LOW_COMPLEXITY_AGENT_TYPES = new Set([
   'explore',
@@ -32,11 +34,27 @@ export interface ParsedTeamWorkerLaunchArgs {
   modelOverride: string | null;
 }
 
+export type TeamWorkerLaunchModelSource = 'env' | 'inherited' | 'fallback' | 'none';
+export type TeamWorkerLaunchReasoningSource = 'explicit' | 'role-default' | 'none';
+
+export interface ResolvedTeamWorkerLaunchDiagnostics {
+  requestedAgentType?: string;
+  requestedDefaultModel?: string;
+  requestedDefaultReasoning?: TeamReasoningEffort;
+  actualModel?: string;
+  actualReasoning?: TeamReasoningEffort;
+  modelSource: TeamWorkerLaunchModelSource;
+  reasoningSource: TeamWorkerLaunchReasoningSource;
+  inheritedParentModel: boolean;
+  actualLaunchArgs: string[];
+}
+
 export interface ResolveTeamWorkerLaunchArgsOptions {
   existingRaw?: string;
   inheritedArgs?: string[];
   fallbackModel?: string;
   preferredReasoning?: TeamReasoningEffort;
+  honorExactRoleModel?: boolean;
 }
 
 
@@ -79,6 +97,50 @@ function normalizeOptionalReasoning(reasoning?: TeamReasoningEffort | string | n
     return normalized;
   }
   return undefined;
+}
+
+function extractReasoningEffort(value: string | null): TeamReasoningEffort | undefined {
+  return normalizeOptionalReasoning(
+    value ? extractConfigStringValue(value, REASONING_KEY) : null,
+  );
+}
+
+function resolveTeamWorkerLaunchDiagnosticsFromParts(params: {
+  envParsed: ParsedTeamWorkerLaunchArgs;
+  inheritedParsed: ParsedTeamWorkerLaunchArgs;
+  fallbackModel?: string;
+  preferredReasoning?: TeamReasoningEffort;
+  actualLaunchArgs: string[];
+  requestedAgentType?: string;
+}): ResolvedTeamWorkerLaunchDiagnostics {
+  const envModel = normalizeOptionalModel(params.envParsed.modelOverride);
+  const inheritedModel = normalizeOptionalModel(params.inheritedParsed.modelOverride);
+  const fallbackModel = normalizeOptionalModel(params.fallbackModel);
+  const actualParsed = parseTeamWorkerLaunchArgs(params.actualLaunchArgs);
+  const requestedDefaultReasoning = normalizeOptionalReasoning(params.preferredReasoning);
+  const explicitReasoning = extractReasoningEffort(
+    params.envParsed.reasoningOverride ?? params.inheritedParsed.reasoningOverride,
+  );
+  const selectedModel = normalizeOptionalModel(actualParsed.modelOverride);
+
+  return {
+    requestedAgentType: params.requestedAgentType,
+    requestedDefaultModel: fallbackModel,
+    requestedDefaultReasoning,
+    actualModel: selectedModel,
+    actualReasoning: extractReasoningEffort(actualParsed.reasoningOverride),
+    modelSource:
+      selectedModel && envModel && selectedModel === envModel && (!inheritedModel || envModel !== inheritedModel)
+        ? 'env'
+        : selectedModel && inheritedModel && selectedModel === inheritedModel
+          ? 'inherited'
+          : selectedModel
+            ? 'fallback'
+            : 'none',
+    reasoningSource: explicitReasoning ? 'explicit' : requestedDefaultReasoning ? 'role-default' : 'none',
+    inheritedParentModel: Boolean(inheritedModel) && Boolean(selectedModel) && selectedModel === inheritedModel,
+    actualLaunchArgs: [...params.actualLaunchArgs],
+  };
 }
 
 export function splitWorkerLaunchArgs(raw: string | undefined): string[] {
@@ -190,6 +252,24 @@ export function normalizeTeamWorkerLaunchArgs(
   return normalized;
 }
 
+function shouldHonorExactRoleModel(options: ResolveTeamWorkerLaunchArgsOptions): boolean {
+  return options.honorExactRoleModel === true && Boolean(options.fallbackModel);
+}
+
+function selectTeamWorkerModel(params: {
+  envModel?: string;
+  inheritedModel?: string;
+  fallbackModel?: string;
+  honorExactRoleModel?: boolean;
+}): string | undefined {
+  const envModel = normalizeOptionalModel(params.envModel);
+  const inheritedModel = normalizeOptionalModel(params.inheritedModel);
+  const fallbackModel = normalizeOptionalModel(params.fallbackModel);
+  if (envModel && envModel !== inheritedModel) return envModel;
+  if (params.honorExactRoleModel && fallbackModel) return fallbackModel;
+  return envModel ?? inheritedModel ?? fallbackModel;
+}
+
 export function resolveTeamWorkerLaunchArgs(options: ResolveTeamWorkerLaunchArgsOptions): string[] {
   const envArgs = splitWorkerLaunchArgs(options.existingRaw);
   const inheritedArgs = options.inheritedArgs ?? [];
@@ -200,9 +280,33 @@ export function resolveTeamWorkerLaunchArgs(options: ResolveTeamWorkerLaunchArgs
   const envModel = normalizeOptionalModel(envParsed.modelOverride);
   const inheritedModel = normalizeOptionalModel(inheritedParsed.modelOverride);
   const fallbackModel = normalizeOptionalModel(options.fallbackModel);
-  const selectedModel = envModel ?? inheritedModel ?? fallbackModel;
+  const selectedModel = selectTeamWorkerModel({
+    envModel,
+    inheritedModel,
+    fallbackModel,
+    honorExactRoleModel: shouldHonorExactRoleModel(options),
+  });
   const selectedModelProvider = envParsed.modelProviderOverride ?? inheritedParsed.modelProviderOverride ?? undefined;
   return normalizeTeamWorkerLaunchArgs(allArgs, selectedModel, options.preferredReasoning, selectedModelProvider);
+}
+
+export function resolveTeamWorkerLaunchDiagnostics(
+  options: ResolveTeamWorkerLaunchArgsOptions & { requestedAgentType?: string },
+): ResolvedTeamWorkerLaunchDiagnostics {
+  const envArgs = splitWorkerLaunchArgs(options.existingRaw);
+  const inheritedArgs = options.inheritedArgs ?? [];
+  const envParsed = parseTeamWorkerLaunchArgs(envArgs);
+  const inheritedParsed = parseTeamWorkerLaunchArgs(inheritedArgs);
+  const actualLaunchArgs = resolveTeamWorkerLaunchArgs(options);
+
+  return resolveTeamWorkerLaunchDiagnosticsFromParts({
+    envParsed,
+    inheritedParsed,
+    fallbackModel: options.fallbackModel,
+    preferredReasoning: options.preferredReasoning,
+    actualLaunchArgs,
+    requestedAgentType: options.requestedAgentType,
+  });
 }
 
 export function resolveAgentReasoningEffort(
@@ -214,6 +318,16 @@ export function resolveAgentReasoningEffort(
     ?? normalizeOptionalReasoning(getAgent(agentType)?.reasoningEffort);
 }
 
+export function shouldHonorAgentExactModel(
+  agentType?: string,
+  codexHomeOverride?: string,
+): boolean {
+  if (typeof agentType !== 'string' || agentType.trim() === '') return false;
+  const normalized = agentType.trim().toLowerCase();
+  if (getAgentModelOverride(normalized, codexHomeOverride)) return true;
+  return Boolean(getAgent(normalized)?.exactModel);
+}
+
 export function resolveAgentDefaultModel(
   agentType?: string,
   codexHomeOverride?: string,
@@ -221,10 +335,15 @@ export function resolveAgentDefaultModel(
   if (typeof agentType !== 'string' || agentType.trim() === '') return undefined;
   const normalized = agentType.trim().toLowerCase();
   if (normalized === '') return undefined;
+  const modelOverride = getAgentModelOverride(normalized, codexHomeOverride);
+  if (modelOverride) return modelOverride;
   if (normalized.endsWith('-low')) return resolveTeamLowComplexityDefaultModel(codexHomeOverride);
+
+  const agent = getAgent(normalized);
+  if (agent?.exactModel) return agent.exactModel;
   if (normalized === 'executor') return getMainDefaultModel(codexHomeOverride);
 
-  switch (getAgent(normalized)?.modelClass) {
+  switch (agent?.modelClass) {
     case 'fast':
       return resolveTeamLowComplexityDefaultModel(codexHomeOverride);
     case 'frontier':

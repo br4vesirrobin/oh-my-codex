@@ -14,6 +14,7 @@ import {
   getCodexConfigRootModelProvider,
   getEnvConfiguredStandardDefaultModel,
   getAgentReasoningOverride,
+  getAgentModelOverride,
   getMainDefaultModel,
   getSparkDefaultModel,
   getStandardDefaultModel,
@@ -21,8 +22,8 @@ import {
 import { getRootModelName } from "../config/generator.js";
 import { codexAgentsDir } from "../utils/paths.js";
 
-export const EXACT_GPT_5_4_MINI_MODEL = "gpt-5.4-mini";
-export const EXACT_RESEARCHER_MODEL = EXACT_GPT_5_4_MINI_MODEL;
+export const EXACT_GPT_5_6_TERRA_MODEL = "gpt-5.6-terra";
+export const EXACT_RESEARCHER_MODEL = EXACT_GPT_5_6_TERRA_MODEL;
 
 const POSTURE_OVERLAYS: Record<AgentDefinition["posture"], string> = {
   "frontier-orchestrator": [
@@ -91,17 +92,19 @@ const MODEL_CLASS_OVERLAYS: Record<AgentDefinition["modelClass"], string> = {
   ].join("\n"),
 };
 
-const EXACT_MINI_MODEL_OVERLAY = [
-  "<exact_model_guidance>",
-  "",
-  `This role is executing under the exact ${EXACT_GPT_5_4_MINI_MODEL} model.`,
-  "- Use a strict execution order: inspect -> plan -> act -> verify.",
-  "- Treat completion criteria as explicit: only report done after the requested work is implemented and fresh verification passes.",
-  "- If requirements are ambiguous or a blocker appears, state the blocker plainly and stop guessing until the missing decision is resolved.",
-  "- Do not bluff, pad, or invent results; report missing evidence and incomplete work honestly.",
-  "",
-  "</exact_model_guidance>",
-].join("\n");
+function buildExactModelOverlay(exactModel: string): string {
+  return [
+    "<exact_model_guidance>",
+    "",
+    `This role is executing under the exact ${exactModel} model.`,
+    "- Use a strict execution order: inspect -> plan -> act -> verify.",
+    "- Treat completion criteria as explicit: only report done after the requested work is implemented and fresh verification passes.",
+    "- If requirements are ambiguous or a blocker appears, state the blocker plainly and stop guessing until the missing decision is resolved.",
+    "- Do not bluff, pad, or invent results; report missing evidence and incomplete work honestly.",
+    "",
+    "</exact_model_guidance>",
+  ].join("\n");
+}
 
 const NATIVE_SUBAGENT_LEAF_GUARD = [
   "<native_subagent_leaf_guard>",
@@ -133,6 +136,7 @@ interface RoleInstructionMetadata {
   modelClass: AgentDefinition["modelClass"];
   routingRole: AgentDefinition["routingRole"];
   nativeSubagentDelegation?: AgentDefinition["nativeSubagentDelegation"];
+  exactModel?: AgentDefinition["exactModel"];
 }
 
 interface ComposeRoleInstructionsOptions {
@@ -174,6 +178,10 @@ function resolveAgentModel(
   agent: AgentDefinition,
   options: AgentModelResolutionOptions = {},
 ): string {
+  const modelOverride = getAgentModelOverride(agent.name, options.codexHomeOverride);
+  if (modelOverride) {
+    return modelOverride;
+  }
   if (agent.exactModel) {
     return agent.exactModel;
   }
@@ -193,8 +201,14 @@ function resolveAgentModel(
   }
 }
 
-function isExactMiniModel(resolvedModel?: string | null): boolean {
-  return resolvedModel?.trim() === EXACT_GPT_5_4_MINI_MODEL;
+function shouldInheritRootModelProvider(
+  agent: AgentDefinition,
+  resolvedModel: string,
+  options: AgentModelResolutionOptions = {},
+): boolean {
+  if (agent.modelClass !== "fast") return true;
+  if (getAgentModelOverride(agent.name, options.codexHomeOverride)) return true;
+  return resolvedModel !== getSparkDefaultModel(options.codexHomeOverride);
 }
 
 export function composeRoleInstructions(
@@ -215,8 +229,12 @@ export function composeRoleInstructions(
     );
   }
 
-  if (isExactMiniModel(resolvedModel)) {
-    parts.push("", EXACT_MINI_MODEL_OVERLAY);
+  const normalizedResolvedModel = resolvedModel?.trim();
+  const exactModel = normalizedResolvedModel === EXACT_GPT_5_6_TERRA_MODEL
+    ? EXACT_GPT_5_6_TERRA_MODEL
+    : metadata?.exactModel;
+  if (exactModel && normalizedResolvedModel === exactModel) {
+    parts.push("", buildExactModelOverlay(exactModel));
   }
 
   if (options.nativeAgent === true && metadata?.nativeSubagentDelegation !== "allowed") {
@@ -261,10 +279,11 @@ export function composeRoleInstructionsForRole(
       ? {
           name: agent.name,
           posture: agent.posture,
-          modelClass: agent.modelClass,
-          routingRole: agent.routingRole,
-          nativeSubagentDelegation: agent.nativeSubagentDelegation,
-        }
+      modelClass: agent.modelClass,
+      routingRole: agent.routingRole,
+      nativeSubagentDelegation: agent.nativeSubagentDelegation,
+      exactModel: agent.exactModel,
+    }
       : null,
     resolvedModel,
   );
@@ -334,7 +353,9 @@ export function generateAgentToml(
   options: AgentModelResolutionOptions = {},
 ): string {
   const resolvedModel = resolveAgentModel(agent, options);
-  const resolvedModelProvider = getCodexConfigRootModelProvider(options.codexHomeOverride);
+  const resolvedModelProvider = shouldInheritRootModelProvider(agent, resolvedModel, options)
+    ? getCodexConfigRootModelProvider(options.codexHomeOverride)
+    : undefined;
   return generateStandaloneAgentToml({
     name: agent.name,
     description: agent.description,

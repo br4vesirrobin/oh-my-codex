@@ -3,9 +3,15 @@ import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from 'node:f
 import { join, relative } from 'node:path';
 import {
   formatCodexGoalReconciliation,
+  buildCompletedCodexGoalRemediation,
   parseCodexGoalSnapshot,
   reconcileCodexGoalSnapshot,
 } from '../goal-workflows/codex-goal-snapshot.js';
+import {
+  LEADER_CONDUCTOR_BLOCK,
+  buildUnsupportedNativeSubagentGuidance,
+  type NativeSubagentSupportEvidence,
+} from '../leader/contract.js';
 
 export const ULTRAGOAL_DIR = '.omx/ultragoal';
 export const ULTRAGOAL_BRIEF = 'brief.md';
@@ -133,6 +139,13 @@ export interface UltragoalItem {
   nonRetriable?: boolean;
   steeringEvidence?: string;
   steeringRationale?: string;
+  resolvesReviewBlockedGoalId?: string;
+  reviewBlockerResolution?: {
+    resolverGoalId: string;
+    status: 'pending' | 'complete';
+    resolvedAt?: string;
+    evidence?: string;
+  };
 }
 
 export interface UltragoalAggregateCompletion {
@@ -141,6 +154,17 @@ export interface UltragoalAggregateCompletion {
   evidence: string;
   codexGoal?: unknown;
 }
+
+export interface UltragoalArchitectureInvariantEvidence {
+  invariant: string;
+  source: string;
+  status: 'proved';
+  implementationEvidence: string;
+  testEvidence: string;
+  reviewEvidence: string;
+  blockers?: never;
+}
+
 
 export interface UltragoalPlan {
   version: 1;
@@ -226,6 +250,10 @@ export interface RecordFinalReviewBlockersOptions extends AddUltragoalGoalOption
   codexGoal?: unknown;
 }
 
+export interface CodexGoalInstructionOptions {
+  nativeSubagentSupport?: NativeSubagentSupportEvidence;
+}
+
 export interface UltragoalQualityGate {
   aiSlopCleaner: {
     status: 'passed';
@@ -251,6 +279,13 @@ export interface UltragoalQualityGate {
       };
     };
   };
+  architectureInvariantGate: {
+    status: 'passed';
+    sourceArtifacts: string[];
+    invariants: UltragoalArchitectureInvariantEvidence[];
+    evidence: string;
+  };
+
 }
 
 export class UltragoalError extends Error {}
@@ -310,8 +345,14 @@ function normalizeIndentedAtxStorySectionLabel(value: string): string | undefine
   return sectionLooksStory(atx) ? atx : undefined;
 }
 
+const MAX_IMPLICIT_MARKDOWN_GOALS = 20;
+
+function sectionLooksPlanReview(section: string | undefined): boolean {
+  return /^(?:review(?:\s+artifact)?|review\s+findings?|findings?|verdict|status|consensus(?:\s+status)?|decision\s+log|approval(?:\s+status)?|implementation\s+notes?|handoff|context|background|summary|scope)$/.test(section ?? '');
+}
+
 function sectionLooksNonStory(section: string | undefined): boolean {
-  return /^(?:acceptance\s+criteria|verification(?:\s+checklist)?|validation(?:\s+checklist)?|checklist|evidence|constraints?|risks?|immediate\s+next\s+actions?|next\s+actions?|follow-?ups?|notes?)$/.test(section ?? '');
+  return /^(?:acceptance\s+criteria|verification(?:\s+checklist)?|validation(?:\s+checklist)?|checklist|evidence|constraints?|risks?|immediate\s+next\s+actions?|next\s+actions?|follow-?ups?|notes?)$/.test(section ?? '') || sectionLooksPlanReview(section);
 }
 
 function sectionLooksStory(section: string | undefined): boolean {
@@ -372,8 +413,77 @@ function topLevelStoryItems(items: readonly MarkdownListItem[]): MarkdownListIte
   return candidates.filter((item) => item.indent === minIndent);
 }
 
+function hasExplicitStorySection(items: readonly MarkdownListItem[]): boolean {
+  return items.some((item) => sectionLooksStory(item.section));
+}
+
+function briefLooksPlanLikeHandoff(lines: readonly string[]): boolean {
+  return lines.some((line) => {
+    const label = normalizeSectionLabel(line);
+    if (sectionLooksPlanReview(label)) return true;
+    return /\b(?:RALPLAN|G\d{3,}\s+(?:verdict|review|status)|review\s+artifact|consensus\s+status|planner\s+consensus|critic\s+review|architect\s+review)\b/i.test(line);
+  });
+}
+
+function assertSafeImplicitMarkdownGoalCount(brief: string, parsedItems: readonly MarkdownListItem[], parentItems: readonly MarkdownListItem[]): void {
+  if (hasExplicitStorySection(parsedItems)) return;
+  if (parentItems.length <= MAX_IMPLICIT_MARKDOWN_GOALS) return;
+  const sourceKind = briefLooksPlanLikeHandoff(brief.split(/\r?\n/)) ? 'plan/review handoff markdown' : 'broad markdown';
+  throw new UltragoalError(`Refusing to derive ${parentItems.length} implicit ultragoal goals from ${sourceKind}. Pass compact executable stories with repeated --goal "Title::Objective" entries, or rewrite the brief with an explicit ### Stories/### Goals section containing no more than ${MAX_IMPLICIT_MARKDOWN_GOALS} parent stories.`);
+}
+
 function normalizeObjective(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
+}
+
+const OBJECTIVE_MAPPING_STOP_WORDS = new Set([
+  'about',
+  'active',
+  'aggregate',
+  'audit',
+  'brief',
+  'build',
+  'clean',
+  'codex',
+  'complete',
+  'completed',
+  'different',
+  'evidence',
+  'fix',
+  'goal',
+  'goals',
+  'implementation',
+  'json',
+  'ledger',
+  'omx',
+  'plan',
+  'planned',
+  'reconcile',
+  'task',
+  'tests',
+  'ultragoal',
+  'unrelated',
+  'validation',
+  'work',
+]);
+
+function objectiveMappingTokens(value: string): Set<string> {
+  const tokens = new Set<string>();
+  for (const token of value.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
+    if (token.length < 5) continue;
+    if (OBJECTIVE_MAPPING_STOP_WORDS.has(token)) continue;
+    tokens.add(token);
+  }
+  return tokens;
+}
+
+function objectivesHaveConservativeSpecificTokenOverlap(actual: string, brief: string): boolean {
+  const actualTokens = objectiveMappingTokens(actual);
+  const briefTokens = objectiveMappingTokens(brief);
+  if (actualTokens.size < 4 || briefTokens.size < 4) return false;
+  const shared = [...actualTokens].filter((token) => briefTokens.has(token)).length;
+  const smallerSpecificSetSize = Math.min(actualTokens.size, briefTokens.size);
+  return shared >= 4 && shared / smallerSpecificSetSize >= 0.6;
 }
 
 function normalizeBlockerEvidence(value: string | undefined): string {
@@ -456,15 +566,37 @@ function textHasCompletionValidationEvidence(value: string | undefined): boolean
 
 async function snapshotObjectiveMapsToUltragoalPlan(cwd: string, snapshotObjective: string): Promise<boolean> {
   const actual = normalizeObjective(snapshotObjective).toLowerCase();
-  if (textMentionsUltragoalPlanArtifact(actual)) return true;
   if (actual.length < 24) return false;
   try {
     const brief = normalizeObjective(await readFile(ultragoalBriefPath(cwd), 'utf-8')).toLowerCase();
     if (!brief || brief.length < 24) return false;
-    return brief.includes(actual) || actual.includes(brief);
+    return brief.includes(actual) || actual.includes(brief) || objectivesHaveConservativeSpecificTokenOverlap(actual, brief);
   } catch {
     return false;
   }
+}
+
+function unresolvedReviewBlockedGoals(plan: UltragoalPlan): UltragoalItem[] {
+  return plan.goals.filter((candidate) => candidate.status === 'review_blocked' && !isReviewBlockedResolved(candidate, plan));
+}
+
+function isDesignatedReviewBlockerResolver(goal: UltragoalItem, parent: UltragoalItem | undefined): boolean {
+  return parent?.status === 'review_blocked'
+    && goal.resolvesReviewBlockedGoalId === parent.id
+    && parent.reviewBlockerResolution?.resolverGoalId === goal.id;
+}
+
+function canUseCleanFinalResolverPathForReviewBlockedParent(
+  plan: UltragoalPlan,
+  goal: UltragoalItem,
+  finalRunCheckpoint: boolean,
+  allowActiveFinalCodexGoal: boolean | undefined,
+): boolean {
+  const unresolvedReviewBlocked = unresolvedReviewBlockedGoals(plan);
+  if (unresolvedReviewBlocked.length !== 1) return false;
+  return finalRunCheckpoint
+    && !allowActiveFinalCodexGoal
+    && isDesignatedReviewBlockerResolver(goal, unresolvedReviewBlocked[0]);
 }
 
 async function canReconcileCompletedTaskScopedAggregateSnapshot(
@@ -571,14 +703,24 @@ function isSupersededResolved(goal: UltragoalItem, plan: UltragoalPlan): boolean
   });
 }
 
+function isReviewBlockedResolved(goal: UltragoalItem, plan: UltragoalPlan): boolean {
+  if (goal.status !== 'review_blocked') return false;
+  const resolverId = goal.reviewBlockerResolution?.resolverGoalId;
+  if (!resolverId || goal.reviewBlockerResolution?.status !== 'complete') return false;
+  const resolver = plan.goals.find((candidate) => candidate.id === resolverId);
+  return resolver?.status === 'complete';
+}
+
 function isCompletionBlocking(goal: UltragoalItem, plan: UltragoalPlan): boolean {
   if (goal.steeringStatus === 'superseded') return !isSupersededResolved(goal, plan);
   if (goal.steeringStatus === 'blocked') return true;
+  if (goal.status === 'review_blocked') return !isReviewBlockedResolved(goal, plan);
   return !isResolvedStatus(goal.status);
 }
 
 function isCompletionBlockingForFinalCandidate(candidate: UltragoalItem, finalCandidate: UltragoalItem, plan: UltragoalPlan): boolean {
   if (candidate.id === finalCandidate.id) return false;
+  if (candidate.status === 'review_blocked' && candidate.reviewBlockerResolution?.resolverGoalId === finalCandidate.id) return false;
   if (candidate.steeringStatus === 'superseded') {
     const replacements = candidate.supersededBy ?? [];
     if (replacements.length === 0) return true;
@@ -616,6 +758,7 @@ export function deriveGoalCandidates(brief: string): Array<{ title: string; obje
   const lines = brief.split(/\r?\n/);
   const parsedItems = parseMarkdownListItems(lines);
   const parentItems = topLevelStoryItems(parsedItems);
+  assertSafeImplicitMarkdownGoalCount(brief, parsedItems, parentItems);
   const listGoals = parentItems
     .map((item, index) => selectedItemObjective(item, lines, parentItems[index + 1]?.lineIndex))
     .filter((objective, index, all) => all.findIndex((candidate) => candidate === objective) === index);
@@ -770,14 +913,16 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
   });
 }
 
-export function summarizeUltragoalPlan(plan: UltragoalPlan): { total: number; pending: number; inProgress: number; complete: number; failed: number; reviewBlocked: number; needsUserDecision: number; superseded: number; steeringBlocked: number; aggregateComplete: boolean; artifactComplete: boolean; activeGoalId?: string } {
+export function summarizeUltragoalPlan(plan: UltragoalPlan): { total: number; pending: number; inProgress: number; complete: number; failed: number; reviewBlocked: number; historicalReviewBlocked: number; needsUserDecision: number; superseded: number; steeringBlocked: number; aggregateComplete: boolean; artifactComplete: boolean; activeGoalId?: string } {
+  const activeReviewBlocked = plan.goals.filter((goal) => goal.status === 'review_blocked' && !isReviewBlockedResolved(goal, plan)).length;
   return {
     total: plan.goals.length,
     pending: plan.goals.filter((goal) => goal.status === 'pending').length,
     inProgress: plan.goals.filter((goal) => goal.status === 'in_progress').length,
     complete: plan.goals.filter((goal) => goal.status === 'complete').length,
     failed: plan.goals.filter((goal) => goal.status === 'failed').length,
-    reviewBlocked: plan.goals.filter((goal) => goal.status === 'review_blocked').length,
+    reviewBlocked: activeReviewBlocked,
+    historicalReviewBlocked: plan.goals.filter((goal) => goal.status === 'review_blocked').length - activeReviewBlocked,
     needsUserDecision: plan.goals.filter((goal) => goal.status === 'needs_user_decision').length,
     superseded: plan.goals.filter((goal) => goal.steeringStatus === 'superseded').length,
     steeringBlocked: plan.goals.filter((goal) => goal.steeringStatus === 'blocked').length,
@@ -812,7 +957,7 @@ export function parseUltragoalSteeringDirective(raw: string): UltragoalSteeringP
 }
 
 
-function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions, nowOverride?: string): UltragoalItem {
+function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions & { resolvesReviewBlockedGoalId?: string }, nowOverride?: string): UltragoalItem {
   const now = nowOverride ?? iso(options.now);
   const title = assertNonEmpty(options.title, '--title');
   const objective = assertNonEmpty(options.objective, '--objective');
@@ -825,6 +970,7 @@ function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions,
     createdAt: now,
     updatedAt: now,
     evidence: options.evidence,
+    resolvesReviewBlockedGoalId: options.resolvesReviewBlockedGoalId,
   };
   plan.goals.push(goal);
   plan.updatedAt = now;
@@ -1174,9 +1320,171 @@ export async function steerUltragoal(cwd: string, proposal: UltragoalSteeringPro
   });
 }
 
-function validateQualityGate(value: unknown): UltragoalQualityGate {
+function normalizeInvariantText(value: string): string {
+  return value.replace(/[`*_~]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+interface RequiredArchitectureInvariant {
+  invariant: string;
+  sourceArtifact: string;
+  source: string;
+}
+
+function requiredInvariantSourceKey(invariant: RequiredArchitectureInvariant): string {
+  return `${normalizeInvariantText(invariant.invariant)}\u0000${invariant.sourceArtifact}`;
+}
+
+function uniqueRequiredArchitectureInvariants(invariants: readonly RequiredArchitectureInvariant[]): RequiredArchitectureInvariant[] {
+  const seen = new Set<string>();
+  const unique: RequiredArchitectureInvariant[] = [];
+  for (const invariant of invariants) {
+    const key = requiredInvariantSourceKey(invariant);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(invariant);
+  }
+  return unique;
+}
+
+function architectureInvariantSectionSlug(label: string): string {
+  return label
+    .replace(/[`*_~]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '') || 'architecture-invariants';
+}
+
+function normalizeSourceArtifact(value: string): string {
+  return value.trim().split('#', 1)[0]?.replace(/\\/g, '/') ?? '';
+}
+
+function sourceReferencesArtifact(source: string, artifact: string): boolean {
+  return normalizeSourceArtifact(source) === normalizeSourceArtifact(artifact);
+}
+
+function sourceReferencesAnyArtifact(source: string, artifacts: readonly string[]): boolean {
+  return artifacts.some((artifact) => sourceReferencesArtifact(source, artifact));
+}
+
+function invariantFromInlineDeclaration(line: string): string | undefined {
+  const trimmed = cleanLine(line).replace(/^['"]|['"]$/g, '').trim();
+  const match = /\b(?:(?:non-negotiable|required)\s+)?(?:architecture|architectural|domain)\s+(?:invariants?|constraints?|non-negotiables?)\s*:\s*(.+)$/i.exec(trimmed)
+    ?? /\bnon-negotiables?\s+(?:architecture|architectural|domain)\s+(?:invariants?|constraints?)\s*:\s*(.+)$/i.exec(trimmed);
+  const invariant = match?.[1]?.trim().replace(/[.;]\s*$/, '').trim();
+  return invariant || undefined;
+}
+
+function extractArchitectureInvariantsFromArtifact(text: string, sourceArtifact: string, sourcePrefix?: string): RequiredArchitectureInvariant[] {
+  const lines = text.split(/\r?\n/);
+  const invariants: RequiredArchitectureInvariant[] = [];
+  let inInvariantSection = false;
+  let sectionSlug = 'architecture-invariants';
+  for (const line of lines) {
+    const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      const label = heading[1] ?? '';
+      const normalizedLabel = label.toLowerCase();
+      inInvariantSection = /\b(?:architecture|architectural|domain|non-negotiable)\b/.test(normalizedLabel) && /\binvariants?\b|\bconstraints?\b|\bnon-negotiables?\b/.test(normalizedLabel);
+      if (inInvariantSection) sectionSlug = architectureInvariantSectionSlug(label);
+      continue;
+    }
+    const inline = invariantFromInlineDeclaration(line);
+    if (inline) {
+      invariants.push({ invariant: inline, sourceArtifact, source: `${sourceArtifact}#${sourcePrefix ?? 'inline-architecture-invariant'}` });
+      continue;
+    }
+    if (!inInvariantSection) continue;
+    const item = cleanLine(line);
+    if (!item || item === line.trim()) continue;
+    invariants.push({ invariant: item, sourceArtifact, source: `${sourceArtifact}#${sourcePrefix ? `${sourcePrefix}-${sectionSlug}` : sectionSlug}` });
+  }
+  return uniqueRequiredArchitectureInvariants(invariants.map((item) => ({ ...item, invariant: item.invariant.trim() })).filter((item) => item.invariant));
+}
+
+function extractArchitectureInvariantsFromBrief(brief: string): RequiredArchitectureInvariant[] {
+  return extractArchitectureInvariantsFromArtifact(brief, `${ULTRAGOAL_DIR}/${ULTRAGOAL_BRIEF}`);
+}
+
+function extractArchitectureInvariantsFromAcceptedSteering(entries: readonly UltragoalLedgerEntry[]): RequiredArchitectureInvariant[] {
+  const invariants: RequiredArchitectureInvariant[] = [];
+  for (const [index, entry] of entries.entries()) {
+    if (entry.event !== 'steering_accepted' || !entry.steering?.invariant.accepted) continue;
+    const sourcePrefix = `steering-${index + 1}`;
+    const steering = entry.steering;
+    const texts = [
+      entry.evidence,
+      entry.message,
+      steering.evidence,
+      steering.rationale,
+      steering.directiveText,
+    ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+    for (const text of texts) {
+      invariants.push(...extractArchitectureInvariantsFromArtifact(text, `${ULTRAGOAL_DIR}/${ULTRAGOAL_LEDGER}`, sourcePrefix));
+    }
+  }
+  return uniqueRequiredArchitectureInvariants(invariants);
+}
+
+async function collectRequiredArchitectureInvariants(cwd: string): Promise<RequiredArchitectureInvariant[]> {
+  const briefInvariants = extractArchitectureInvariantsFromBrief(await readFile(ultragoalBriefPath(cwd), 'utf-8'));
+  const steeringInvariants = extractArchitectureInvariantsFromAcceptedSteering(await readSteeringLedgerEntries(cwd));
+  return uniqueRequiredArchitectureInvariants([...briefInvariants, ...steeringInvariants]);
+}
+
+
+function validateArchitectureInvariantGate(gate: Partial<UltragoalQualityGate>, requiredInvariants: readonly RequiredArchitectureInvariant[]): void {
+  const invariantGate = gate.architectureInvariantGate;
+  if (!invariantGate || typeof invariantGate !== 'object') {
+    throw new UltragoalError('Final quality gate is missing architectureInvariantGate evidence; include derived architecture/domain invariants, source artifacts, implementation/test/review evidence, or record final blockers for unproved invariants.');
+  }
+  if (invariantGate.status !== 'passed') {
+    throw new UltragoalError('Final architecture-invariant gate requires architectureInvariantGate.status="passed"; record blocker-resolution work for unproved invariants.');
+  }
+  if (!Array.isArray(invariantGate.sourceArtifacts)) {
+    throw new UltragoalError('Final architecture-invariant gate requires architectureInvariantGate.sourceArtifacts.');
+  }
+  const sourceArtifacts = invariantGate.sourceArtifacts.map((source) => assertNonEmpty(source, 'architectureInvariantGate.sourceArtifacts[]'));
+  for (const required of requiredInvariants) {
+    if (!sourceArtifacts.some((source) => sourceReferencesArtifact(source, required.sourceArtifact))) {
+      throw new UltragoalError(`Final architecture-invariant gate sourceArtifacts must include required invariant source artifact: ${required.sourceArtifact}`);
+    }
+  }
+  assertNonEmpty(invariantGate.evidence, 'architectureInvariantGate.evidence');
+  if (!Array.isArray(invariantGate.invariants)) {
+    throw new UltragoalError('Final architecture-invariant gate requires architectureInvariantGate.invariants.');
+  }
+  const provided = new Map<string, UltragoalArchitectureInvariantEvidence[]>();
+  for (const invariant of invariantGate.invariants) {
+    if (!invariant || typeof invariant !== 'object') throw new UltragoalError('Final architecture-invariant gate invariants must be objects.');
+    const record = invariant as Partial<UltragoalArchitectureInvariantEvidence> & { blockers?: unknown };
+    const text = assertNonEmpty(record.invariant, 'architectureInvariantGate.invariants[].invariant');
+    const source = assertNonEmpty(record.source, 'architectureInvariantGate.invariants[].source');
+    if (!sourceReferencesAnyArtifact(source, sourceArtifacts)) {
+      throw new UltragoalError(`Final architecture invariant "${text}" source must reference one of architectureInvariantGate.sourceArtifacts; decorative provenance labels are not sufficient.`);
+    }
+    if (record.status !== 'proved') throw new UltragoalError(`Final architecture invariant "${text}" is not proved; record blocker-resolution work before final completion.`);
+    if (record.blockers !== undefined) throw new UltragoalError(`Final architecture invariant "${text}" has blockers; record blocker-resolution work before final completion.`);
+    assertNonEmpty(record.implementationEvidence, 'architectureInvariantGate.invariants[].implementationEvidence');
+    assertNonEmpty(record.testEvidence, 'architectureInvariantGate.invariants[].testEvidence');
+    assertNonEmpty(record.reviewEvidence, 'architectureInvariantGate.invariants[].reviewEvidence');
+    const key = normalizeInvariantText(text);
+    const records = provided.get(key) ?? [];
+    records.push(record as UltragoalArchitectureInvariantEvidence);
+    provided.set(key, records);
+  }
+  for (const required of requiredInvariants) {
+    const matches = provided.get(normalizeInvariantText(required.invariant)) ?? [];
+    if (matches.length === 0) {
+      throw new UltragoalError(`Final architecture-invariant gate is missing proof for required invariant from ${required.sourceArtifact}: ${required.invariant}`);
+    }
+    if (!matches.some((record) => sourceReferencesArtifact(record.source, required.sourceArtifact))) {
+      throw new UltragoalError(`Final architecture-invariant gate proof for required invariant must reference ${required.sourceArtifact}: ${required.invariant}`);
+    }
+  }
+}
+
+function validateQualityGate(value: unknown, requiredInvariants: readonly RequiredArchitectureInvariant[] = []): UltragoalQualityGate {
   if (!value || typeof value !== 'object') {
-    throw new UltragoalError('Final ultragoal completion requires --quality-gate-json with ai-slop-cleaner, verification, and code-review evidence.');
+    throw new UltragoalError('Final ultragoal completion requires --quality-gate-json with ai-slop-cleaner, verification, code-review, and architecture-invariant evidence.');
   }
   const gate = value as Partial<UltragoalQualityGate>;
   const cleaner = gate.aiSlopCleaner;
@@ -1221,6 +1529,7 @@ function validateQualityGate(value: unknown): UltragoalQualityGate {
     throw new UltragoalError('Final code-review must use an independent architect subagent; self-review or default/authoring-lane review cannot approve the ultragoal gate.');
   }
   assertNonEmpty(architect.evidence, 'codeReview.independentReview.architect.evidence');
+  validateArchitectureInvariantGate(gate, requiredInvariants);
   return gate as UltragoalQualityGate;
 }
 
@@ -1319,6 +1628,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
     return plan;
   }
   let aggregateCompletion: UltragoalAggregateCompletion | undefined;
+  let normalFinalAggregateCompletion: UltragoalAggregateCompletion | undefined;
   if (options.status === 'complete') {
     const expectedObjective = expectedCodexObjective(plan, goal);
     const aggregateMode = codexGoalMode(plan) === 'aggregate';
@@ -1341,17 +1651,29 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
         && snapshot.status === 'complete'
         && Boolean(snapshot.objective)
         && normalizeObjective(snapshot.objective ?? '') !== normalizeObjective(expectedObjective)
-        && await canReconcileCompletedTaskScopedAggregateSnapshot(cwd, plan, goal, snapshot.objective ?? '', options.evidence);
+        && await canReconcileCompletedTaskScopedAggregateSnapshot(
+          cwd,
+          plan,
+          goal,
+          snapshot.objective ?? '',
+          options.evidence,
+        );
       if (completedTaskScopedAggregateSnapshot) {
-        aggregateCompletion = {
-          status: 'complete',
-          completedAt: now,
-          evidence: assertNonEmpty(options.evidence, '--evidence'),
-          codexGoal: options.codexGoal,
-        };
+        if (unresolvedReviewBlockedGoals(plan).length > 0) {
+          if (!canUseCleanFinalResolverPathForReviewBlockedParent(plan, goal, finalRunCheckpoint, options.allowActiveFinalCodexGoal)) {
+            throw new UltragoalError('Completed task-scoped aggregate reconciliation is not allowed while unresolved review_blocked parent goals exist; only the parent\'s designated resolver may continue through the clean final quality gate path.');
+          }
+        } else {
+          aggregateCompletion = {
+            status: 'complete',
+            completedAt: now,
+            evidence: assertNonEmpty(options.evidence, '--evidence'),
+            codexGoal: options.codexGoal,
+          };
+        }
       } else {
         const taskScopedRequirement = aggregateMode && snapshot?.status === 'complete' && Boolean(snapshot.objective)
-          ? ' Completed task-scoped aggregate reconciliation requires the checkpoint goal to be the active in-progress OMX goal, evidence that names that active OMX goal id, names .omx/ultragoal/goals.json or ledger.jsonl, includes completed implementation plus validation/review evidence, and a get_goal objective that maps to the ultragoal brief/artifact.'
+          ? ' Completed task-scoped aggregate reconciliation requires the checkpoint goal to be the active in-progress OMX goal, evidence that names that active OMX goal id, names .omx/ultragoal/goals.json or ledger.jsonl, includes completed implementation plus validation/review evidence, and a get_goal objective that maps to the ultragoal brief.'
           : '';
         const remediation = reconciliation.snapshot.available
           && reconciliation.snapshot.status === 'complete'
@@ -1364,16 +1686,50 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
         throw new UltragoalError(`${formatCodexGoalReconciliation(reconciliation)}${taskScopedRequirement}${remediation}`);
       }
     }
+    const designatedReviewBlockerResolver = goal.resolvesReviewBlockedGoalId
+      ? isDesignatedReviewBlockerResolver(
+        goal,
+        plan.goals.find((candidate) => candidate.id === goal.resolvesReviewBlockedGoalId),
+      )
+      : false;
+    if (aggregateMode && finalRunCheckpoint && !options.allowActiveFinalCodexGoal && designatedReviewBlockerResolver) {
+      normalFinalAggregateCompletion = {
+        status: 'complete',
+        completedAt: now,
+        evidence: assertNonEmpty(options.evidence, '--evidence'),
+        codexGoal: options.codexGoal,
+      };
+    }
     if (finalRunCheckpoint && !options.allowActiveFinalCodexGoal) goal.evidence = options.evidence;
   }
+  const requiredArchitectureInvariants = options.status === 'complete' && (aggregateCompletion !== undefined || (isFinalRunCompletionCandidate(plan, goal) && !options.allowActiveFinalCodexGoal))
+    ? await collectRequiredArchitectureInvariants(cwd)
+    : [];
   const qualityGate = options.status === 'complete' && (aggregateCompletion !== undefined || (isFinalRunCompletionCandidate(plan, goal) && !options.allowActiveFinalCodexGoal))
-    ? validateQualityGate(options.qualityGate)
+    ? validateQualityGate(options.qualityGate, requiredArchitectureInvariants)
     : undefined;
   if (aggregateCompletion) {
+    goal.status = 'complete';
+    goal.completedAt = now;
+    goal.updatedAt = now;
+    goal.evidence = options.evidence;
+    goal.failureReason = undefined;
+    goal.failedAt = undefined;
+    clearGoalBlockerFields(goal);
     plan.aggregateCompletion = aggregateCompletion;
     if (plan.activeGoalId === goal.id) delete plan.activeGoalId;
     plan.updatedAt = now;
     await writePlan(cwd, plan);
+    await appendLedger(cwd, {
+      ts: now,
+      event: 'goal_completed',
+      goalId: goal.id,
+      status: goal.status,
+      evidence: options.evidence,
+      codexGoal: options.codexGoal,
+      qualityGate,
+      message: 'Active repo-native microgoal completed while reconciling a completed task-scoped aggregate Codex goal snapshot.',
+    });
     await appendLedger(cwd, {
       ts: now,
       event: 'aggregate_completed',
@@ -1382,7 +1738,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
       evidence: options.evidence,
       codexGoal: options.codexGoal,
       qualityGate,
-      message: 'Aggregate ultragoal plan completed via task-scoped Codex goal snapshot; microgoal ledger progress remains independent.',
+      message: 'Aggregate ultragoal plan completed via task-scoped Codex goal snapshot; checkpointed active microgoal row was reconciled to complete.',
     });
     return plan;
   }
@@ -1394,6 +1750,22 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
     goal.failureReason = undefined;
     goal.failedAt = undefined;
     clearGoalBlockerFields(goal);
+    if (normalFinalAggregateCompletion) plan.aggregateCompletion = normalFinalAggregateCompletion;
+    const resolvedParent = goal.resolvesReviewBlockedGoalId
+      ? plan.goals.find((candidate) => candidate.id === goal.resolvesReviewBlockedGoalId)
+      : undefined;
+    if (resolvedParent?.status === 'review_blocked' && resolvedParent.reviewBlockerResolution?.resolverGoalId === goal.id && qualityGate) {
+      resolvedParent.status = 'complete';
+      resolvedParent.completedAt = now;
+      resolvedParent.updatedAt = now;
+      resolvedParent.reviewBlockerResolution = {
+        resolverGoalId: goal.id,
+        status: 'complete',
+        resolvedAt: now,
+        evidence: options.evidence,
+      };
+      clearGoalBlockerFields(resolvedParent);
+    }
     if (plan.activeGoalId === goal.id) delete plan.activeGoalId;
   } else {
     const blocker = classifyExternalAuthorizationBlocker(options.evidence);
@@ -1430,6 +1802,33 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
       ? `Blocked on repeated external authorization. Required decision: ${goal.requiredExternalDecision}.`
       : undefined,
   });
+  if (options.status === 'complete' && goal.resolvesReviewBlockedGoalId) {
+    const resolvedParent = plan.goals.find((candidate) => candidate.id === goal.resolvesReviewBlockedGoalId);
+    if (resolvedParent?.reviewBlockerResolution?.status === 'complete' && resolvedParent.reviewBlockerResolution.resolverGoalId === goal.id) {
+      await appendLedger(cwd, {
+        ts: now,
+        event: 'goal_completed',
+        goalId: resolvedParent.id,
+        status: resolvedParent.status,
+        evidence: options.evidence,
+        codexGoal: options.codexGoal,
+        qualityGate,
+        message: `Review-blocked final story resolved by ${goal.id}; original failed review remains in prior final_review_failed/goal_review_blocked ledger entries.`,
+      });
+    }
+  }
+  if (normalFinalAggregateCompletion) {
+    await appendLedger(cwd, {
+      ts: now,
+      event: 'aggregate_completed',
+      goalId: goal.id,
+      status: goal.status,
+      evidence: options.evidence,
+      codexGoal: options.codexGoal,
+      qualityGate,
+      message: 'Aggregate ultragoal plan completed with a clean final quality gate.',
+    });
+  }
   return plan;
   });
 }
@@ -1464,7 +1863,7 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
     throw new UltragoalError(formatCodexGoalReconciliation(reconciliation));
   }
 
-  const addedGoal = appendGoalToPlan(plan, { ...options, now: options.now });
+  const addedGoal = appendGoalToPlan(plan, { ...options, now: options.now, resolvesReviewBlockedGoalId: goal.id });
   goal.status = 'review_blocked';
   goal.reviewBlockedAt = now;
   goal.updatedAt = now;
@@ -1472,6 +1871,11 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
   goal.failedAt = undefined;
   goal.failureReason = undefined;
   goal.evidence = options.evidence;
+  goal.reviewBlockerResolution = {
+    resolverGoalId: addedGoal.id,
+    status: 'pending',
+    evidence: options.evidence,
+  };
   if (plan.activeGoalId === goal.id) delete plan.activeGoalId;
   plan.updatedAt = now;
 
@@ -1507,18 +1911,32 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
   });
 }
 
-export function buildCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalPlan): string {
-  if (codexGoalMode(plan) === 'aggregate') return buildAggregateCodexGoalInstruction(goal, plan);
-  return buildPerStoryCodexGoalInstruction(goal, plan);
+function codexGoalConductorGuidance(options: CodexGoalInstructionOptions): string {
+  if (options.nativeSubagentSupport?.status !== 'unsupported') return LEADER_CONDUCTOR_BLOCK;
+  return [
+    buildUnsupportedNativeSubagentGuidance(options.nativeSubagentSupport),
+    'Native independent review unavailable: do not treat final review as clean, do not call update_goal for clean completion, and use omx ultragoal record-review-blockers to create a non-clean blocker for the missing native independent review.',
+  ].join('\n');
 }
 
-function buildPerStoryCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalPlan): string {
+export function buildCodexGoalInstruction(
+  goal: UltragoalItem,
+  plan: UltragoalPlan,
+  options: CodexGoalInstructionOptions = {},
+): string {
+  if (codexGoalMode(plan) === 'aggregate') return buildAggregateCodexGoalInstruction(goal, plan, options);
+  return buildPerStoryCodexGoalInstruction(goal, plan, options);
+}
+
+function buildPerStoryCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalPlan, options: CodexGoalInstructionOptions): string {
   const createPayload = {
     objective: goal.objective,
     ...(goal.tokenBudget ? { token_budget: goal.tokenBudget } : {}),
   };
   const finalStory = isFinalRunCompletionCandidate(plan, goal);
   return [
+    codexGoalConductorGuidance(options),
+    '',
     'Ultragoal active-goal handoff',
     `Plan: ${plan.goalsPath}`,
     `Ledger: ${plan.ledgerPath}`,
@@ -1526,6 +1944,7 @@ function buildPerStoryCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalP
     '',
     'Codex goal integration constraints:',
     '- First call get_goal. If no active goal exists, call create_goal with the payload below.',
+    `- If get_goal reports status complete before create_goal, do not call create_goal over it. ${buildCompletedCodexGoalRemediation('Ultragoal preflight')}`,
     '- If a different active Codex goal exists, finish/checkpoint that goal before starting this ultragoal.',
     '- Ultragoal cannot call /goal clear from the model/shell tool surface. For another per-story goal in the same session/thread after a completed Codex goal, manually run /goal clear in the Codex UI before creating the next goal.',
     '- If get_goal returns a different completed legacy/thread goal and create_goal rejects because this thread already has a completed goal, continue only from a Codex goal context with no active/completed conflicting goal in the same repo/worktree and create the payload there.',
@@ -1552,6 +1971,9 @@ function buildPerStoryCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalP
     finalStory
       ? `  omx ultragoal checkpoint --goal-id ${goal.id} --status complete --evidence "<tests/files/PR evidence>" --codex-goal-json "<fresh complete get_goal JSON or path>" --quality-gate-json "<quality gate JSON or path>"`
       : null,
+    finalStory
+      ? '- After the final checkpoint command succeeds, treat `/goal clear` as the explicit terminal cleanup step before another same-thread goal.'
+      : null,
     '- If blocked or failed, checkpoint with --status failed and the failure evidence; rerun complete-goals --retry-failed to resume.',
     '',
     'create_goal payload:',
@@ -1562,12 +1984,14 @@ function buildPerStoryCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalP
   ].filter((line): line is string => line !== null).join('\n');
 }
 
-function buildAggregateCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalPlan): string {
+function buildAggregateCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalPlan, options: CodexGoalInstructionOptions): string {
   const objective = plan.codexObjective ?? aggregateCodexObjective(plan.goals);
   const finalStory = isFinalRunCompletionCandidate(plan, goal);
   const createPayload = { objective };
   const checkpointStatus = finalStory ? 'complete' : 'active';
   return [
+    codexGoalConductorGuidance(options),
+    '',
     'Ultragoal aggregate-goal handoff',
     `Plan: ${plan.goalsPath}`,
     `Ledger: ${plan.ledgerPath}`,
@@ -1577,6 +2001,7 @@ function buildAggregateCodexGoalInstruction(goal: UltragoalItem, plan: Ultragoal
     '- Codex goal = the whole ultragoal run; OMX G001/G002/etc. = ledger stories.',
     '- First call get_goal. If no active goal exists, call create_goal with the aggregate payload below.',
     '- If get_goal reports the same aggregate objective as active, continue this OMX story without creating a new Codex goal.',
+    `- If get_goal reports status complete before create_goal, do not call create_goal over it. ${buildCompletedCodexGoalRemediation('Ultragoal preflight')}`,
     '- If a different active or incomplete Codex goal exists, finish/checkpoint that goal before starting this ultragoal; do not replace hidden Codex state from the shell.',
     '- Ultragoal does not call /goal clear. After a completed aggregate run, manually run /goal clear in the Codex UI before starting another ultragoal run in the same session/thread.',
     finalStory
@@ -1593,6 +2018,9 @@ function buildAggregateCodexGoalInstruction(goal: UltragoalItem, plan: Ultragoal
       : null,
     finalStory
       ? '- If final $code-review is clean (APPROVE + CLEAR + independent code-reviewer and architect subagent evidence), call update_goal({status: "complete"}), call get_goal again for a fresh complete snapshot, then checkpoint with --quality-gate-json.'
+      : null,
+    finalStory
+      ? '- After the final checkpoint command succeeds, treat `/goal clear` as the explicit terminal cleanup step before another same-thread goal.'
       : null,
     `- Checkpoint this OMX story with a fresh get_goal snapshot whose objective matches the aggregate payload and whose status is ${checkpointStatus}:`,
     finalStory

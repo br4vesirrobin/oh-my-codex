@@ -6,6 +6,9 @@ import {
 export const OMX_GENERATED_AGENTS_MARKER = '<!-- omx:generated:agents-md -->'
 export const OMX_MANAGED_AGENTS_START_MARKER = '<!-- OMX:AGENTS:START -->'
 export const OMX_MANAGED_AGENTS_END_MARKER = '<!-- OMX:AGENTS:END -->'
+export const OMX_USER_POLICY_START_MARKER = '<!-- USER:OMX:POLICY:START -->'
+export const OMX_USER_POLICY_END_MARKER = '<!-- USER:OMX:POLICY:END -->'
+
 export const OMX_AGENTS_CONTRACT_HEADING =
   '# oh-my-codex - Intelligent Multi-Agent Orchestration'
 const OMX_AGENTS_CONTRACT_REQUIRED_TEXT = [
@@ -49,6 +52,37 @@ function candidateHasOmxAgentsContract(content: string): boolean {
   )
 }
 
+export function extractUserOmxPolicyBlocks(content: string): string[] {
+  const blocks: string[] = []
+  let searchFrom = 0
+
+  while (searchFrom < content.length) {
+    const startIndex = content.indexOf(OMX_USER_POLICY_START_MARKER, searchFrom)
+    if (startIndex === -1) break
+
+    const endIndex = content.indexOf(OMX_USER_POLICY_END_MARKER, startIndex)
+    if (endIndex === -1) break
+
+    const blockEnd = endIndex + OMX_USER_POLICY_END_MARKER.length
+    blocks.push(content.slice(startIndex, blockEnd))
+    searchFrom = blockEnd
+  }
+
+  return blocks
+}
+
+export function preserveUserOmxPolicyBlocks(
+  existingContent: string,
+  nextContent: string,
+): string {
+  const missingBlocks = extractUserOmxPolicyBlocks(existingContent).filter(
+    (block) => !nextContent.includes(block),
+  )
+  if (missingBlocks.length === 0) return nextContent
+
+  const normalizedNext = nextContent.endsWith('\n') ? nextContent : `${nextContent}\n`
+  return `${normalizedNext.trimEnd()}\n\n${missingBlocks.join('\n\n')}\n`
+}
 export function upsertManagedAgentsBlock(
   existingContent: string,
   managedContent: string,
@@ -74,6 +108,10 @@ export function upsertManagedAgentsBlock(
     return next.endsWith('\n') ? next : `${next}\n`
   }
 
+  if (isOmxGeneratedAgentsMd(normalizedExisting)) {
+    return preserveUserOmxPolicyBlocks(normalizedExisting, normalizedManaged)
+  }
+
   return `${normalizedExisting.trimEnd()}\n\n${block}\n`
 }
 
@@ -83,11 +121,12 @@ export function addGeneratedAgentsMarker(content: string): string {
   const autonomyDirectiveEnd = content.indexOf(AUTONOMY_DIRECTIVE_END_MARKER)
   if (autonomyDirectiveEnd >= 0) {
     const insertAt = autonomyDirectiveEnd + AUTONOMY_DIRECTIVE_END_MARKER.length
-    const hasImmediateNewline = content[insertAt] === '\n'
-    const insertionPoint = hasImmediateNewline ? insertAt + 1 : insertAt
+    const lineEnding = content.startsWith('\r\n', insertAt) ? '\r\n' : '\n'
+    const hasImmediateNewline = content.startsWith(lineEnding, insertAt)
+    const insertionPoint = hasImmediateNewline ? insertAt + lineEnding.length : insertAt
     return (
       content.slice(0, insertionPoint) +
-      `${OMX_GENERATED_AGENTS_MARKER}\n` +
+      `${OMX_GENERATED_AGENTS_MARKER}${lineEnding}` +
       content.slice(insertionPoint)
     )
   }

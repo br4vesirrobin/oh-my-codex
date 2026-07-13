@@ -425,6 +425,35 @@ export function shouldSelfExitForPreTrafficSiblingHardCap(
   return observation.newerSiblingPids.length >= maxSiblingsPerEntrypoint;
 }
 
+export function shouldSelfExitForPostTrafficSiblingHardCap(
+  observation: DuplicateSiblingObservation,
+  nowMs: number,
+  duplicateObservedAtMs: number | null,
+  lastTrafficAtMs: number | null,
+  maxSiblingsPerEntrypoint = DEFAULT_MAX_SIBLINGS_PER_ENTRYPOINT,
+  postTrafficIdleMs = DEFAULT_DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_MS,
+): boolean {
+  if (observation.status !== 'older_duplicate') return false;
+  // Pre-traffic siblings are reaped by shouldSelfExitForPreTrafficSiblingHardCap.
+  if (lastTrafficAtMs === null) return false;
+  if (!Number.isInteger(maxSiblingsPerEntrypoint) || maxSiblingsPerEntrypoint <= 0) return false;
+  if (observation.matchingPids.length <= maxSiblingsPerEntrypoint) return false;
+  // Only the oldest siblings beyond the retained window are eligible; the newest N
+  // same-parent same-entrypoint contexts are always preserved.
+  if (observation.newerSiblingPids.length < maxSiblingsPerEntrypoint) return false;
+  if (duplicateObservedAtMs === null) return false;
+  if (!Number.isFinite(nowMs) || duplicateObservedAtMs > nowMs) return false;
+  if (!Number.isFinite(lastTrafficAtMs) || lastTrafficAtMs > nowMs) return false;
+
+  // Measure the idle window from the duplicate observation rather than the last
+  // stdin byte. A long-lived Codex.app parent can keep superseded first-party
+  // siblings warm with periodic keepalive traffic, which would otherwise reset
+  // the post-traffic idle timer forever and let same-parent same-entrypoint
+  // duplicates accumulate without bound. Once a sibling has stayed superseded for
+  // the full idle window while still over the cap, reap it.
+  return nowMs - duplicateObservedAtMs >= postTrafficIdleMs;
+}
+
 export function isParentProcessAlive(
   parentPid: number,
   signalProcess: typeof process.kill = process.kill,
@@ -439,6 +468,19 @@ export function isParentProcessAlive(
   } catch (error) {
     return (error as NodeJS.ErrnoException | undefined)?.code === 'EPERM';
   }
+}
+
+export function shouldStopDuplicateSiblingWatchdogAfterTraffic(
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform === 'win32';
+}
+
+export function shouldRunDuplicateSiblingStartupScanBeforeStopping(
+  hasPendingInitialDelay: boolean,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform === 'win32' && hasPendingInitialDelay;
 }
 
 export function shouldAutoStartMcpServer(
@@ -520,6 +562,26 @@ export function autoStartStdioMcpServer(
   parentWatchdog?.unref();
   let duplicateSiblingWatchdog: ReturnType<typeof setInterval> | null = null;
   let duplicateSiblingInitialDelayTimer: ReturnType<typeof setTimeout> | null = null;
+  const stopDuplicateSiblingWatchdog = (reason: string, options: { runPendingInitialScan?: boolean } = {}) => {
+    let stopped = false;
+    if (duplicateSiblingInitialDelayTimer) {
+      clearTimeout(duplicateSiblingInitialDelayTimer);
+      duplicateSiblingInitialDelayTimer = null;
+      if (options.runPendingInitialScan) {
+        runDuplicateSiblingWatchdog();
+      }
+      stopped = true;
+    }
+    if (duplicateSiblingWatchdog) {
+      clearInterval(duplicateSiblingWatchdog);
+      duplicateSiblingWatchdog = null;
+      stopped = true;
+    }
+    if (stopped) {
+      emitLifecycle('duplicate_sibling_watchdog_stopped', { reason });
+    }
+  };
+
 
   const runDuplicateSiblingWatchdog = () => {
     try {
@@ -558,6 +620,18 @@ export function autoStartStdioMcpServer(
         lifecycleTiming.maxSiblingsPerEntrypoint,
       )) {
         void shutdown('superseded_hard_cap_pre_traffic');
+        return;
+      }
+
+      if (shouldSelfExitForPostTrafficSiblingHardCap(
+        observation,
+        Date.now(),
+        duplicateObservedAtMs,
+        lastTrafficAtMs,
+        lifecycleTiming.maxSiblingsPerEntrypoint,
+        lifecycleTiming.duplicateSiblingPostTrafficIdleMs,
+      )) {
+        void shutdown('superseded_hard_cap_post_traffic');
         return;
       }
 
@@ -618,12 +692,7 @@ export function autoStartStdioMcpServer(
     if (parentWatchdog) {
       clearInterval(parentWatchdog);
     }
-    if (duplicateSiblingInitialDelayTimer) {
-      clearTimeout(duplicateSiblingInitialDelayTimer);
-    }
-    if (duplicateSiblingWatchdog) {
-      clearInterval(duplicateSiblingWatchdog);
-    }
+    stopDuplicateSiblingWatchdog('shutdown');
     process.stdin.off('data', handleStdinData);
     process.stdin.off('end', handleStdinEnd);
     process.stdin.off('close', handleStdinClose);
@@ -648,6 +717,12 @@ export function autoStartStdioMcpServer(
   };
   const handleStdinData = () => {
     lastTrafficAtMs = Date.now();
+    const hasPendingInitialDelay = duplicateSiblingInitialDelayTimer !== null;
+    if (shouldStopDuplicateSiblingWatchdogAfterTraffic()) {
+      stopDuplicateSiblingWatchdog('windows_stdio_traffic', {
+        runPendingInitialScan: shouldRunDuplicateSiblingStartupScanBeforeStopping(hasPendingInitialDelay),
+      });
+    }
   };
   const handleSigterm = () => {
     void shutdown('sigterm');

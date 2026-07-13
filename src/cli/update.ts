@@ -27,6 +27,7 @@ export interface UserInstallStamp {
   install_channel?: UpdateChannel;
   install_source?: string;
   install_revision?: string;
+  dev_base_version?: string;
   updated_at: string;
 }
 
@@ -67,6 +68,7 @@ const DEV_INSTALL_SOURCE = 'github:Yeachan-Heo/oh-my-codex#dev';
 const DEV_REPOSITORY_URL = 'https://github.com/Yeachan-Heo/oh-my-codex.git';
 const DEV_REPOSITORY_BRANCH = 'dev';
 const DEV_UPDATE_TIMEOUT_MS = 300000;
+const SKIP_NATIVE_AGENT_REFRESH_ENV = 'OMX_SKIP_NATIVE_AGENT_REFRESH';
 
 export function resolveUpdateChannelConfig(channel: UpdateChannel = 'stable'): UpdateChannelConfig {
   if (channel === 'dev') {
@@ -157,12 +159,12 @@ async function getCurrentVersion(): Promise<string | null> {
   }
 }
 
-function isEnoentSpawnError(error: unknown): boolean {
+function isSpawnErrorCode(error: unknown, codes: string[]): boolean {
   return Boolean(
     error &&
     typeof error === 'object' &&
     'code' in error &&
-    (error as NodeJS.ErrnoException).code === 'ENOENT',
+    codes.includes(String((error as NodeJS.ErrnoException).code)),
   );
 }
 
@@ -173,10 +175,34 @@ function spawnNpmSync(
   platform: NodeJS.Platform = process.platform,
 ): ReturnType<SpawnSyncLike> {
   const result = spawnProcess('npm', args, options);
-  if (platform === 'win32' && isEnoentSpawnError(result.error)) {
+  if (platform === 'win32' && isSpawnErrorCode(result.error, ['ENOENT'])) {
     return spawnProcess('npm.cmd', args, options);
   }
   return result;
+}
+
+function spawnGlobalNpmInstallSync(
+  installSource: string,
+  options: SpawnSyncOptions,
+  spawnProcess: SpawnSyncLike = spawnSync,
+  platform: NodeJS.Platform = process.platform,
+): ReturnType<SpawnSyncLike> {
+  const args = ['install', '-g', installSource];
+  const result = spawnProcess('npm', args, options);
+  if (platform !== 'win32' || !isSpawnErrorCode(result.error, ['ENOENT', 'EINVAL'])) {
+    return result;
+  }
+
+  if (isSpawnErrorCode(result.error, ['ENOENT'])) {
+    const cmdShimResult = spawnProcess('npm.cmd', args, options);
+    if (!isSpawnErrorCode(cmdShimResult.error, ['ENOENT', 'EINVAL'])) {
+      return cmdShimResult;
+    }
+  }
+
+  // Some Windows/npm shim layouts reject direct npm/npm.cmd spawn with EINVAL;
+  // cmd.exe can still resolve and run npm from the user's configured PATH.
+  return spawnProcess('cmd.exe', ['/d', '/s', '/c', 'npm', ...args], options);
 }
 
 function commandFailure(stderr: unknown, status: number | null, label: string): RunGlobalUpdateResult {
@@ -355,8 +381,8 @@ export function runGlobalUpdate(
     return runDevGlobalUpdate(spawnProcess, resolvedPlatform);
   }
 
-  const result = spawnNpmSync(
-    ['install', '-g', installSource],
+  const result = spawnGlobalNpmInstallSync(
+    installSource,
     {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -444,6 +470,7 @@ export function runDeferredGlobalUpdate(
       ...process.env,
       OMX_DEFERRED_UPDATE_LOG: logPath,
       OMX_DEFERRED_UPDATE_PARENT_PID: String(parentPid),
+      [SKIP_NATIVE_AGENT_REFRESH_ENV]: '1',
     };
 
     const command = platform === 'win32' ? 'powershell.exe' : 'sh';
@@ -578,6 +605,7 @@ async function writeSuccessfulInstallStamp(
     channel?: UpdateChannel;
     source?: string;
     revision?: string | null;
+    devBaseVersion?: string | null;
   } = {},
 ): Promise<void> {
   await writeUserInstallStamp({
@@ -586,6 +614,7 @@ async function writeSuccessfulInstallStamp(
     ...(metadata.channel ? { install_channel: metadata.channel } : {}),
     ...(metadata.source ? { install_source: metadata.source } : {}),
     ...(metadata.revision ? { install_revision: metadata.revision } : {}),
+    ...(metadata.devBaseVersion ? { dev_base_version: stripLeadingV(metadata.devBaseVersion) } : {}),
     updated_at: new Date().toISOString(),
   });
 }
@@ -613,6 +642,9 @@ export async function readUserInstallStamp(
         : {}),
       ...(typeof parsed.install_revision === 'string'
         ? { install_revision: parsed.install_revision }
+        : {}),
+      ...(typeof parsed.dev_base_version === 'string'
+        ? { dev_base_version: parsed.dev_base_version }
         : {}),
       updated_at: parsed.updated_at,
     };
@@ -643,6 +675,30 @@ function doesSetupStampMatchVersion(
   stamp: UserInstallStamp | null,
 ): boolean {
   return stripLeadingV(stamp?.setup_completed_version ?? '') === stripLeadingV(currentVersion);
+}
+
+function resolveUpdateCheckBaseline(
+  currentVersion: string | null,
+  stamp: UserInstallStamp | null,
+): string | null {
+  if (!currentVersion) return null;
+  const current = stripLeadingV(currentVersion);
+  const stampVersion = stripLeadingV(stamp?.setup_completed_version ?? stamp?.installed_version ?? '');
+  const devBaseVersion = stripLeadingV(stamp?.dev_base_version ?? '');
+
+  // Launch-time update checks must not synthesize dev_base_version from npm
+  // latest alone. A dev baseline is install metadata, so only a matching dev
+  // stamp written by a successful dev update can raise the comparison baseline.
+  if (
+    stamp?.install_channel === 'dev' &&
+    stampVersion === current &&
+    devBaseVersion &&
+    isNewerVersion(current, devBaseVersion)
+  ) {
+    return devBaseVersion;
+  }
+
+  return currentVersion;
 }
 
 export function resolveGlobalInstallRoot(
@@ -795,8 +851,12 @@ async function executeUpdate(
   const channelConfig = resolveUpdateChannelConfig(channel);
   const [current, latest] = await Promise.all([
     dependencies.getCurrentVersion(),
-    channel === 'stable' || !forceInstall ? dependencies.fetchLatestVersion() : Promise.resolve(null),
+    channel === 'stable' || !forceInstall || channel === 'dev' ? dependencies.fetchLatestVersion() : Promise.resolve(null),
   ]);
+  const installStamp = await dependencies.readUserInstallStamp();
+  const updateCheckBaseline = !forceInstall
+    ? resolveUpdateCheckBaseline(current, installStamp)
+    : current;
 
   try {
     await dependencies.writeUpdateState(cwd, {
@@ -808,19 +868,18 @@ async function executeUpdate(
     // just because the current working directory is read-only or unavailable.
   }
 
-  if (!forceInstall && (!current || !latest)) {
+  if (!forceInstall && (!updateCheckBaseline || !latest)) {
     if (immediate) {
       console.log('[omx] Unable to determine the latest oh-my-codex version. Try again later.');
     }
     return { status: 'unavailable', currentVersion: current, latestVersion: latest };
   }
 
-  if (!forceInstall && current && latest && !isNewerVersion(current, latest)) {
+  if (!forceInstall && updateCheckBaseline && latest && !isNewerVersion(updateCheckBaseline, latest)) {
     if (immediate) {
-      const installStamp = await dependencies.readUserInstallStamp();
-      if (!doesSetupStampMatchVersion(current, installStamp)) {
+      if (current && !doesSetupStampMatchVersion(current, installStamp)) {
         console.log(
-          `[omx] oh-my-codex is already up to date (v${current}). Running setup refresh...`,
+          `[omx] oh-my-codex is already up to date (v${updateCheckBaseline}). Running setup refresh...`,
         );
         const setupRefreshResult = await dependencies.runSetupRefresh(cwd);
         if (!setupRefreshResult.ok) {
@@ -830,13 +889,13 @@ async function executeUpdate(
           return { status: 'failed', currentVersion: current, latestVersion: latest };
         }
         await writeSuccessfulInstallStamp(current);
-        console.log(`[omx] Setup refresh completed for v${current}. Restart to use current code.`);
+        console.log(`[omx] Setup refresh completed for v${updateCheckBaseline}. Restart to use current code.`);
         return { status: 'up-to-date', currentVersion: current, latestVersion: latest };
       }
     }
 
     if (immediate) {
-      console.log(`[omx] oh-my-codex is already up to date (v${current}).`);
+      console.log(`[omx] oh-my-codex is already up to date (v${updateCheckBaseline}).`);
     }
     return { status: 'up-to-date', currentVersion: current, latestVersion: latest };
   }
@@ -844,8 +903,8 @@ async function executeUpdate(
   if (prompt) {
     const approved = await dependencies.askYesNo(
       immediate
-        ? `[omx] Update available: v${current} → v${latest}. Update now? [Y/n] `
-        : `[omx] Update available: v${current} → v${latest}. Update after this session exits? [Y/n] `,
+        ? `[omx] Update available: v${updateCheckBaseline} → v${latest}. Update now? [Y/n] `
+        : `[omx] Update available: v${updateCheckBaseline} → v${latest}. Update after this session exits? [Y/n] `,
     );
     if (!approved) {
       return { status: 'declined', currentVersion: current, latestVersion: latest };
@@ -891,6 +950,11 @@ async function executeUpdate(
   const installedRevision = channelConfig.channel === 'dev'
     ? ((await dependencies.getInstalledRevisionAfterUpdate()) ?? result.revision ?? null)
     : null;
+  const devBaseVersion = channelConfig.channel === 'dev'
+    ? (latest && installedVersion
+        ? (isNewerVersion(latest, installedVersion) ? installedVersion : latest)
+        : latest)
+    : null;
   const stampVersion = channelConfig.channel === 'stable'
     ? (latest ?? installedVersion ?? current)
     : installedVersion;
@@ -899,6 +963,7 @@ async function executeUpdate(
       channel: channelConfig.channel,
       source: channelConfig.installSource,
       revision: channelConfig.channel === 'dev' ? installedRevision : null,
+      devBaseVersion,
     });
   } else if (channelConfig.channel === 'dev') {
     console.log(
@@ -911,6 +976,9 @@ async function executeUpdate(
   console.log(
     `[omx] Updated ${channelConfig.channel} channel${versionSummary}. Restart to use new code.`,
   );
+  if (channelConfig.channel === 'dev') {
+    console.log('[omx] Dev display version may differ from the package/plugin manifest version; start a new Codex session if /skills still shows stale OMX plugin skill metadata.');
+  }
   return { status: 'updated', currentVersion: current, latestVersion: latest };
 }
 

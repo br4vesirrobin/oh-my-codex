@@ -218,13 +218,14 @@ export function hudPaneMatchesOwner(pane: TmuxPaneSnapshot, owner: HudPaneOwner 
   const paneOwner = readHudPaneOwner(pane);
   const sessionMatches = wantsSession && wantedSessionIds.includes(paneOwner.sessionId ?? '');
   const leaderPaneMatches = wantsLeaderPane && paneOwner.leaderPaneId === wantedLeaderPaneId;
+  const hasLeaderTag = paneOwner.leaderPaneId !== undefined && paneOwner.leaderPaneId !== '';
 
   if (wantsSession && wantsLeaderPane) {
-    if (!sessionMatches) return false;
-    return !paneOwner.leaderPaneId || leaderPaneMatches;
+    if (hasLeaderTag) return sessionMatches && leaderPaneMatches;
+    return sessionMatches;
   }
   if (wantsSession) return sessionMatches;
-  return leaderPaneMatches && !paneOwner.sessionId;
+  return leaderPaneMatches;
 }
 
 export function findHudWatchPaneIds(
@@ -447,9 +448,6 @@ function buildHudLayoutReconcileHookCommand(
   const cwd = options.cwd?.trim() || process.cwd();
   const leaderAlive = buildNestedTmuxCommand(tmuxBin, ['display-message', '-p', '-t', leaderPaneId, '#{pane_id}'], env.TMUX);
   const unregister = buildHudHookUnregisterCommand(tmuxBin, context, env.TMUX);
-  const lockName = `${context.hookName}_layout`;
-  const lock = buildNestedTmuxCommand(tmuxBin, ['wait-for', '-L', lockName], env.TMUX);
-  const unlock = buildNestedTmuxCommand(tmuxBin, ['wait-for', '-U', lockName], env.TMUX);
   const reconcileEnv = buildEnvPrefix({
     TMUX: env.TMUX,
     TMUX_PANE: leaderPaneId,
@@ -468,7 +466,7 @@ function buildHudLayoutReconcileHookCommand(
     'hud',
     '--reconcile-tmux',
   ].join(' ');
-  return `${leaderAlive} >/dev/null 2>&1 && (${lock} >/dev/null 2>&1; ${unregister}; ${reconcile} >/dev/null 2>&1; status=$?; ${unlock} >/dev/null 2>&1; exit $status) || (${unregister})`;
+  return `${leaderAlive} >/dev/null 2>&1 && (${unregister}; ${reconcile} >/dev/null 2>&1; status=$?; exit $status) || (${unregister})`;
 }
 
 function unregisterLegacyHudResizeHook(

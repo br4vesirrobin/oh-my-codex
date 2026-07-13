@@ -20,6 +20,7 @@ import {
   type UltragoalPlan,
   type UltragoalSteeringProposal,
 } from '../artifacts.js';
+import { LEADER_CONDUCTOR_BLOCK, buildUnsupportedNativeSubagentGuidance } from '../../leader/contract.js';
 import { steeringFixtures, type SteeringFixtureProposal } from './steering-fixtures.js';
 
 async function withTempRepo<T>(run: (cwd: string) => Promise<T>): Promise<T> {
@@ -44,7 +45,18 @@ function cleanQualityGate(): object {
         architect: { agentRole: 'architect', evidence: 'architect subagent returned CLEAR' },
       },
     },
+    architectureInvariantGate: {
+      status: 'passed',
+      sourceArtifacts: ['.omx/ultragoal/brief.md', '.omx/ultragoal/goals.json'],
+      invariants: [],
+      evidence: 'architect verified no additional architecture invariants were declared in the brief',
+    },
+
   };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 async function writeFixturePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
@@ -161,6 +173,49 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  it('does not atomize RALPLAN review and consensus sections into pseudo-goals', async () => {
+    await withTempRepo(async (cwd) => {
+      const brief = [
+        '# Approved RALPLAN handoff',
+        '',
+        'Review artifact:',
+        '- G104 verdict: APPROVE after evidence review',
+        '- Review artifact: .gjc/plans/ralplan/run/review.md',
+        '- Critic review: verification is concrete',
+        '',
+        'Consensus status:',
+        '- Planner consensus: approved',
+        '- Architect review: CLEAR',
+        '- Implementation notes remain advisory until converted to compact goals',
+        '',
+        'Verification checklist:',
+        '- Run targeted tests',
+        '- Run build checks',
+      ].join('\n');
+
+      const plan = await createUltragoalPlan(cwd, { brief });
+
+      assert.equal(plan.goals.length, 1);
+      assert.equal(plan.goals[0]?.title, '# Approved RALPLAN handoff');
+      assert.doesNotMatch(plan.goals[0]?.id ?? '', /g104|verdict|review-artifact|consensus-status/);
+    });
+  });
+
+  it('fails closed for broad implicit plan-like markdown without compact stories', async () => {
+    await withTempRepo(async (cwd) => {
+      const broadBrief = [
+        '# RALPLAN approved handoff',
+        'Consensus status: approved for execution.',
+        ...Array.from({ length: 21 }, (_, index) => `- Review or handoff detail ${index + 1}`),
+      ].join('\n');
+
+      await assert.rejects(
+        () => createUltragoalPlan(cwd, { brief: broadBrief }),
+        /Refusing to derive 21 implicit ultragoal goals.*--goal "Title::Objective".*### Stories\/### Goals/s,
+      );
+    });
+  });
+
   it('keeps later sibling stories after an indented plain-label note', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -273,6 +328,7 @@ describe('ultragoal artifacts', () => {
       assert.match(instruction, /Complete the durable ultragoal plan/);
       assert.match(instruction, /including later accepted\/appended stories/);
       assert.match(instruction, /\.omx\/ultragoal\/ledger\.jsonl/);
+      assert.match(instruction, new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
       assert.match(instruction, /Complete first milestone/);
       assert.match(instruction, /does not call \/goal clear/);
       assert.match(instruction, /manually run \/goal clear/);
@@ -294,6 +350,7 @@ describe('ultragoal artifacts', () => {
       assert.match(aggregateInstruction, /independentReview evidence from both code-reviewer and architect subagents/);
       assert.match(aggregateInstruction, /independent delegation is unavailable\/skipped\/failed, do not call update_goal/);
       assert.match(aggregateInstruction, /APPROVE \+ CLEAR \+ independent code-reviewer and architect subagent evidence/);
+      assert.match(aggregateInstruction, new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
 
       await createUltragoalPlan(cwd, {
         brief: 'brief',
@@ -307,6 +364,20 @@ describe('ultragoal artifacts', () => {
       assert.match(perStoryInstruction, /independentReview evidence from both code-reviewer and architect subagents/);
       assert.match(perStoryInstruction, /independent delegation is unavailable\/skipped\/failed, do not call update_goal/);
       assert.match(perStoryInstruction, /APPROVE \+ CLEAR \+ independent code-reviewer and architect subagent evidence/);
+      assert.match(perStoryInstruction, new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
+
+      const nativeSubagentSupport = {
+        status: 'unsupported' as const,
+        reason: 'native_subagents_unsupported' as const,
+        source: 'persisted_support_blocker' as const,
+        evidenceSummary: 'native subagents are disabled in this runtime',
+      };
+      const unsupportedInstruction = buildCodexGoalInstruction(perStory.goal!, perStory.plan, { nativeSubagentSupport });
+      assert.doesNotMatch(unsupportedInstruction, /Conductor mode contract:/);
+      assert.match(unsupportedInstruction, new RegExp(escapeRegExp(buildUnsupportedNativeSubagentGuidance(nativeSubagentSupport))));
+      assert.match(unsupportedInstruction, /record-review-blockers/);
+      assert.match(unsupportedInstruction, /non-clean blocker/);
+      assert.match(unsupportedInstruction, /Native independent review unavailable/);
     });
   });
 
@@ -394,8 +465,11 @@ describe('ultragoal artifacts', () => {
       });
 
       assert.equal(reconciled.goals.length, 136);
-      assert.equal(reconciled.goals.filter((goal) => goal.status === 'complete').length, 0);
-      assert.equal(reconciled.goals[0]?.status, 'in_progress');
+      assert.equal(reconciled.goals.filter((candidate) => candidate.status === 'complete').length, 1);
+      assert.equal(reconciled.goals[0]?.status, 'complete');
+      assert.equal(reconciled.goals[0]?.completedAt, '2026-05-04T10:04:00.000Z');
+      assert.match(reconciled.goals[0]?.evidence ?? '', /planned work done/);
+      assert.equal(reconciled.goals[0]?.failureReason, undefined);
       assert.equal(reconciled.activeGoalId, undefined);
       assert.equal(reconciled.aggregateCompletion?.status, 'complete');
       assert.match(reconciled.aggregateCompletion?.evidence ?? '', /planned work done/);
@@ -406,9 +480,9 @@ describe('ultragoal artifacts', () => {
       assert.equal(next.done, true);
 
       const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
-      assert.match(ledger, /microgoal ledger progress remains independent/);
+      assert.match(ledger, /checkpointed active microgoal row was reconciled to complete/);
       assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 1);
-      assert.equal((ledger.match(/"event":"goal_completed"/g) ?? []).length, 0);
+      assert.equal((ledger.match(/"event":"goal_completed"/g) ?? []).length, 1);
     });
   });
 
@@ -430,6 +504,17 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'Actual planned work done for .omx/ultragoal/goals.json G001-first; validation complete; reviews clean.',
           codexGoal: { goal: { objective: 'Unrelated completed task', status: 'complete' } },
+          qualityGate: cleanQualityGate(),
+        }),
+        /objective mismatch/,
+      );
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: first.goal!.id,
+          status: 'complete',
+          evidence: 'Actual planned work done for .omx/ultragoal/goals.json G001-first; validation complete; reviews clean.',
+          codexGoal: { goal: { objective: 'Audit .omx/ultragoal/goals.json for a different unrelated task', status: 'complete' } },
           qualityGate: cleanQualityGate(),
         }),
         /objective mismatch/,
@@ -727,6 +812,12 @@ describe('ultragoal artifacts', () => {
 
       assert.equal(result.blockedGoal.status, 'review_blocked');
       assert.equal(result.addedGoal.status, 'pending');
+      assert.equal(result.addedGoal.resolvesReviewBlockedGoalId, result.blockedGoal.id);
+      assert.deepEqual(result.blockedGoal.reviewBlockerResolution, {
+        resolverGoalId: result.addedGoal.id,
+        status: 'pending',
+        evidence: 'code-review REQUEST CHANGES',
+      });
       assert.equal(result.plan.activeGoalId, undefined);
       assert.equal(result.plan.codexObjective, objective);
 
@@ -736,6 +827,168 @@ describe('ultragoal artifacts', () => {
       const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
       assert.match(ledger, /"event":"final_review_failed"/);
       assert.match(ledger, /"event":"goal_review_blocked"/);
+    });
+  });
+
+  it('reconciles a review-blocked final story when the appended resolver completes with a clean quality gate', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+
+      const blocked = await recordFinalReviewBlockers(cwd, {
+        goalId: started.goal!.id,
+        title: 'Resolve final code-review blockers',
+        objective: 'Fix final code-review blockers and rerun final gates.',
+        evidence: 'code-reviewer REQUEST CHANGES before resolver',
+        codexGoal: { goal: { objective, status: 'active' } },
+      });
+      assert.equal(blocked.blockedGoal.status, 'review_blocked');
+      assert.equal(summarizeUltragoalPlan(blocked.plan).reviewBlocked, 1);
+
+      const resolver = await startNextUltragoal(cwd);
+      assert.equal(resolver.goal?.id, blocked.addedGoal.id);
+      assert.equal(isFinalRunCompletionCandidate(resolver.plan, resolver.goal!), true);
+
+      const completed = await checkpointUltragoal(cwd, {
+        goalId: blocked.addedGoal.id,
+        status: 'complete',
+        evidence: `${blocked.addedGoal.id} fixed blockers; final gate passed for .omx/ultragoal/goals.json`,
+        codexGoal: { goal: { objective, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+      });
+      const parent = completed.goals.find((goal) => goal.id === blocked.blockedGoal.id);
+      const summary = summarizeUltragoalPlan(completed);
+
+      assert.equal(parent?.status, 'complete');
+      assert.equal(parent?.reviewBlockerResolution?.status, 'complete');
+      assert.equal(parent?.reviewBlockerResolution?.resolverGoalId, blocked.addedGoal.id);
+      assert.equal(summary.complete, 2);
+      assert.equal(summary.reviewBlocked, 0);
+      assert.equal(summary.steeringBlocked, 0);
+      assert.equal(summary.aggregateComplete, true);
+      assert.equal(summary.artifactComplete, true);
+      assert.equal(isUltragoalDone(completed), true);
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"final_review_failed"/);
+      assert.match(ledger, /code-reviewer REQUEST CHANGES before resolver/);
+      assert.match(ledger, /Review-blocked final story resolved by/);
+      assert.match(ledger, /"event":"aggregate_completed"/);
+    });
+  });
+
+  it('does not reconcile a review-blocked parent from a non-designated resolver goal', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+      const blocked = await recordFinalReviewBlockers(cwd, {
+        goalId: started.goal!.id,
+        title: 'Resolve final code-review blockers',
+        objective: 'Fix final code-review blockers and rerun final gates.',
+        evidence: 'code-reviewer REQUEST CHANGES before resolver',
+        codexGoal: { goal: { objective, status: 'active' } },
+      });
+
+      const planPath = join(cwd, '.omx/ultragoal/goals.json');
+      const tampered = JSON.parse(await readFile(planPath, 'utf-8')) as UltragoalPlan;
+      tampered.goals.push({
+        id: 'G999-forged-resolver',
+        title: 'Forged resolver',
+        objective: 'Try to forge resolver metadata.',
+        status: 'in_progress',
+        attempt: 1,
+        createdAt: '2026-06-24T00:00:00.000Z',
+        updatedAt: '2026-06-24T00:00:00.000Z',
+        startedAt: '2026-06-24T00:00:00.000Z',
+        resolvesReviewBlockedGoalId: blocked.blockedGoal.id,
+      });
+      tampered.activeGoalId = 'G999-forged-resolver';
+      await writeFile(planPath, `${JSON.stringify(tampered, null, 2)}\n`);
+
+      const completed = await checkpointUltragoal(cwd, {
+        goalId: 'G999-forged-resolver',
+        status: 'complete',
+        evidence: 'forged resolver completed with tests but is not the designated review blocker resolver',
+        codexGoal: { goal: { objective, status: 'active' } },
+      });
+      const parent = completed.goals.find((goal) => goal.id === blocked.blockedGoal.id);
+      const summary = summarizeUltragoalPlan(completed);
+
+      assert.equal(parent?.status, 'review_blocked');
+      assert.equal(parent?.reviewBlockerResolution?.resolverGoalId, blocked.addedGoal.id);
+      assert.equal(summary.reviewBlocked, 1);
+      assert.equal(summary.aggregateComplete, false);
+      assert.equal(summary.artifactComplete, false);
+    });
+  });
+
+  it('fails closed when a forged non-designated resolver presents completed task-scoped aggregate proof', async () => {
+    await withTempRepo(async (cwd) => {
+      const taskObjective = 'Fix review-blocked ultragoal resolver reconciliation tracked in .omx/ultragoal/goals.json without allowing forged aggregate completion.';
+      await createUltragoalPlan(cwd, {
+        brief: taskObjective,
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const aggregateObjective = started.plan.codexObjective!;
+      const blocked = await recordFinalReviewBlockers(cwd, {
+        goalId: started.goal!.id,
+        title: 'Resolve final code-review blockers',
+        objective: 'Fix final code-review blockers and rerun final gates.',
+        evidence: 'code-reviewer REQUEST CHANGES before resolver',
+        codexGoal: { goal: { objective: aggregateObjective, status: 'active' } },
+      });
+
+      const planPath = join(cwd, '.omx/ultragoal/goals.json');
+      const tampered = JSON.parse(await readFile(planPath, 'utf-8')) as UltragoalPlan;
+      tampered.goals.push({
+        id: 'G999-forged-resolver',
+        title: 'Forged resolver',
+        objective: 'Try to forge resolver metadata.',
+        status: 'in_progress',
+        attempt: 1,
+        createdAt: '2026-06-24T00:00:00.000Z',
+        updatedAt: '2026-06-24T00:00:00.000Z',
+        startedAt: '2026-06-24T00:00:00.000Z',
+        resolvesReviewBlockedGoalId: blocked.blockedGoal.id,
+      });
+      tampered.activeGoalId = 'G999-forged-resolver';
+      await writeFile(planPath, `${JSON.stringify(tampered, null, 2)}\n`);
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: 'G999-forged-resolver',
+          status: 'complete',
+          evidence: 'G999-forged-resolver completed planned work for .omx/ultragoal/goals.json; passed tests; final quality gate clean.',
+          codexGoal: { goal: { objective: taskObjective, status: 'complete' } },
+          qualityGate: cleanQualityGate(),
+        }),
+        /Completed task-scoped aggregate reconciliation (?:requires|is not allowed)|objective mismatch/,
+      );
+
+      const plan = await readUltragoalPlan(cwd);
+      const parent = plan.goals.find((goal) => goal.id === blocked.blockedGoal.id);
+      const designatedResolver = plan.goals.find((goal) => goal.id === blocked.addedGoal.id);
+      const forgedResolver = plan.goals.find((goal) => goal.id === 'G999-forged-resolver');
+      const summary = summarizeUltragoalPlan(plan);
+
+      assert.equal(parent?.status, 'review_blocked');
+      assert.equal(parent?.reviewBlockerResolution?.resolverGoalId, blocked.addedGoal.id);
+      assert.equal(designatedResolver?.status, 'pending');
+      assert.equal(forgedResolver?.status, 'in_progress');
+      assert.equal(plan.aggregateCompletion, undefined);
+      assert.equal(summary.reviewBlocked, 1);
+      assert.equal(summary.aggregateComplete, false);
+      assert.equal(summary.artifactComplete, false);
+      assert.equal(isUltragoalDone(plan), false);
     });
   });
 
@@ -837,6 +1090,30 @@ describe('ultragoal artifacts', () => {
             codeReview: {
               recommendation: 'APPROVE',
               architectStatus: 'CLEAR',
+              evidence: 'native independent review unavailable',
+            },
+            nativeSubagentSupport: {
+              status: 'unsupported',
+              reason: 'native_subagents_unsupported',
+              source: 'persisted_support_blocker',
+              evidenceSummary: 'native subagents are disabled in this runtime',
+            },
+          },
+        }),
+        /independent review unavailable|self-approving/i,
+      );
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: started.goal!.id,
+          status: 'complete',
+          evidence: 'tests passed',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: {
+            ...cleanQualityGate(),
+            codeReview: {
+              recommendation: 'APPROVE',
+              architectStatus: 'CLEAR',
               evidence: 'authoring lane claimed it was merge-ready',
               independentReview: {
                 codeReviewer: { agentRole: 'executor', evidence: 'authoring lane approved its own change' },
@@ -882,6 +1159,267 @@ describe('ultragoal artifacts', () => {
       assert.match(ledger, /"qualityGate"/);
       assert.match(ledger, /"aiSlopCleaner"/);
       assert.match(ledger, /"codeReview"/);
+    });
+  });
+
+  it('requires final architecture invariant proof from the brief before clean completion', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: [
+          'Ship the integration safely.',
+          '',
+          '## Architecture Invariants',
+          '- Preserve the existing parser boundary.',
+          '- Do not introduce a second scheduler.',
+        ].join('\n'),
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: started.goal!.id,
+          status: 'complete',
+          evidence: 'tests passed',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: cleanQualityGate(),
+        }),
+        /missing proof for required invariant from \.omx\/ultragoal\/brief\.md: Preserve the existing parser boundary/i,
+      );
+
+      await checkpointUltragoal(cwd, {
+        goalId: started.goal!.id,
+        status: 'complete',
+        evidence: 'final gates passed',
+        codexGoal: { goal: { objective, status: 'complete' } },
+        qualityGate: {
+          ...cleanQualityGate(),
+          architectureInvariantGate: {
+            status: 'passed',
+            sourceArtifacts: ['.omx/ultragoal/brief.md', '.omx/ultragoal/goals.json'],
+            evidence: 'all declared invariants have implementation, test, and review proof',
+            invariants: [
+              {
+                invariant: 'Preserve the existing parser boundary.',
+                source: '.omx/ultragoal/brief.md#architecture-invariants',
+                status: 'proved',
+                implementationEvidence: 'parser changes stayed inside src/parser without scheduler coupling',
+                testEvidence: 'parser boundary regression test passed',
+                reviewEvidence: 'architect review confirmed parser boundary remained intact',
+              },
+              {
+                invariant: 'Do not introduce a second scheduler.',
+                source: '.omx/ultragoal/brief.md#architecture-invariants',
+                status: 'proved',
+                implementationEvidence: 'implementation reused the existing scheduler entrypoint',
+                testEvidence: 'scheduler singleton regression passed',
+                reviewEvidence: 'architect review confirmed no duplicate scheduler path',
+              },
+            ],
+          },
+        },
+      });
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(isUltragoalDone(plan), true);
+    });
+  });
+
+  it('requires final architecture invariant proof from accepted steering annotations', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'Ship the integration safely without a brief invariant section.',
+        goals: [
+          { title: 'Audit steering invariant', objective: 'Accept steering invariant annotation.' },
+          { title: 'Final', objective: 'Complete final milestone.' },
+        ],
+      });
+      const first = await startNextUltragoal(cwd);
+      await steerUltragoal(cwd, {
+        kind: 'annotate_ledger',
+        source: 'finding',
+        evidence: 'Reviewer finding. Architecture invariant: Ledger entries remain append-only',
+        rationale: 'Non-negotiable architecture invariant: Ledger entries remain append-only',
+      });
+      await checkpointUltragoal(cwd, {
+        goalId: first.goal!.id,
+        status: 'complete',
+        evidence: 'steering invariant accepted for final gate coverage',
+        codexGoal: { goal: { objective: first.plan.codexObjective!, status: 'active' } },
+        allowActiveFinalCodexGoal: true,
+      });
+      const final = await startNextUltragoal(cwd);
+      const objective = final.plan.codexObjective!;
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: final.goal!.id,
+          status: 'complete',
+          evidence: 'tests passed',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: {
+            ...cleanQualityGate(),
+            architectureInvariantGate: {
+              status: 'passed',
+              sourceArtifacts: ['.omx/ultragoal/ledger.jsonl'],
+              invariants: [],
+              evidence: 'architect verified no additional architecture invariants were declared in the brief',
+            },
+          },
+        }),
+        /missing proof for required invariant from \.omx\/ultragoal\/ledger\.jsonl: Ledger entries remain append-only/i,
+      );
+
+      await checkpointUltragoal(cwd, {
+        goalId: final.goal!.id,
+        status: 'complete',
+        evidence: 'final gates passed',
+        codexGoal: { goal: { objective, status: 'complete' } },
+        qualityGate: {
+          ...cleanQualityGate(),
+          architectureInvariantGate: {
+            status: 'passed',
+            sourceArtifacts: ['.omx/ultragoal/ledger.jsonl'],
+            evidence: 'accepted steering invariant has implementation, test, and review proof',
+            invariants: [
+              {
+                invariant: 'Ledger entries remain append-only',
+                source: '.omx/ultragoal/ledger.jsonl#steering-3-inline-architecture-invariant',
+                status: 'proved',
+                implementationEvidence: 'appendLedger only appends JSONL records',
+                testEvidence: 'ledger append-only regression passed',
+                reviewEvidence: 'architect review confirmed ledger mutation remains append-only',
+              },
+            ],
+          },
+        },
+      });
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(isUltragoalDone(plan), true);
+    });
+  });
+
+  it('rejects decorative architecture invariant provenance labels that omit source artifacts', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: [
+          'Ship the integration safely.',
+          '',
+          '## Architecture Invariants',
+          '- Preserve the existing parser boundary.',
+        ].join('\n'),
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: started.goal!.id,
+          status: 'complete',
+          evidence: 'tests passed',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: {
+            ...cleanQualityGate(),
+            architectureInvariantGate: {
+              status: 'passed',
+              sourceArtifacts: ['review-note: claims brief coverage'],
+              evidence: 'decorative label claims the invariant came from the brief',
+              invariants: [
+                {
+                  invariant: 'Preserve the existing parser boundary.',
+                  source: 'review-note: brief architecture invariant',
+                  status: 'proved',
+                  implementationEvidence: 'parser boundary preserved',
+                  testEvidence: 'parser boundary test passed',
+                  reviewEvidence: 'architect review confirmed parser boundary',
+                },
+              ],
+            },
+          },
+        }),
+        /sourceArtifacts must include required invariant source artifact: \.omx\/ultragoal\/brief\.md/i,
+      );
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: started.goal!.id,
+          status: 'complete',
+          evidence: 'tests passed',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: {
+            ...cleanQualityGate(),
+            architectureInvariantGate: {
+              status: 'passed',
+              sourceArtifacts: ['.omx/ultragoal/brief.md'],
+              evidence: 'source artifact is listed but record source is decorative',
+              invariants: [
+                {
+                  invariant: 'Preserve the existing parser boundary.',
+                  source: 'review-note: brief architecture invariant',
+                  status: 'proved',
+                  implementationEvidence: 'parser boundary preserved',
+                  testEvidence: 'parser boundary test passed',
+                  reviewEvidence: 'architect review confirmed parser boundary',
+                },
+              ],
+            },
+          },
+        }),
+        /source must reference one of architectureInvariantGate\.sourceArtifacts|decorative provenance labels/i,
+      );
+    });
+  });
+
+  it('blocks final completion when architecture invariants are unproved or carry blockers', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: '## Domain Invariants\n- Ledger entries remain append-only.',
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: started.goal!.id,
+          status: 'complete',
+          evidence: 'tests passed',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: {
+            ...cleanQualityGate(),
+            architectureInvariantGate: {
+              status: 'passed',
+              sourceArtifacts: ['.omx/ultragoal/brief.md'],
+              evidence: 'invariant audit found unresolved blocker',
+              invariants: [
+                {
+                  invariant: 'Ledger entries remain append-only.',
+                  source: '.omx/ultragoal/brief.md#domain-invariants',
+                  status: 'blocked',
+                  implementationEvidence: 'mutation path still rewrites prior entries',
+                  testEvidence: 'append-only regression not written',
+                  reviewEvidence: 'architect BLOCK',
+                  blockers: ['existing migration rewrites ledger history'],
+                },
+              ],
+            },
+          },
+        }),
+        /not proved|blocker-resolution work/i,
+      );
+
+      const result = await recordFinalReviewBlockers(cwd, {
+        goalId: started.goal!.id,
+        title: 'Resolve final architecture invariant blockers',
+        objective: 'Prove ledger append-only behavior and rerun final quality gates.',
+        evidence: 'architectureInvariantGate found unproved invariant: Ledger entries remain append-only.',
+        codexGoal: { goal: { objective, status: 'active' } },
+      });
+      assert.equal(result.blockedGoal.status, 'review_blocked');
+      assert.match(result.addedGoal.objective, /ledger append-only/i);
     });
   });
 

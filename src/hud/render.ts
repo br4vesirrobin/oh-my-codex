@@ -105,6 +105,12 @@ function renderAutopilot(ctx: HudRenderContext): string | null {
   return yellow(`autopilot:${phase}`);
 }
 
+function renderStaleAutopilot(ctx: HudRenderContext): string | null {
+  if (!ctx.staleAutopilot) return null;
+  const phase = sanitizeDynamicText(ctx.staleAutopilot.current_phase || 'active') || 'active';
+  return yellow(`autopilot:stale:${phase}`);
+}
+
 function renderRalplan(ctx: HudRenderContext): string | null {
   if (!ctx.ralplan) return null;
   const iteration = ctx.ralplan.iteration;
@@ -134,6 +140,9 @@ function renderCodeReview(ctx: HudRenderContext): string | null {
   if (!ctx.codeReview) return null;
   if (ctx.codeReview.source === 'autopilot' && !isAutopilotLateGateSource(ctx, 'code-review')) return null;
   const phase = sanitizeDynamicText(ctx.codeReview.current_phase || 'active') || 'active';
+  if (ctx.codeReview.source === 'autopilot') {
+    return green(`autopilot:code-review`);
+  }
   return green(`code-review:${phase}`);
 }
 
@@ -141,6 +150,9 @@ function renderUltraqa(ctx: HudRenderContext): string | null {
   if (!ctx.ultraqa) return null;
   if (ctx.ultraqa.source === 'autopilot' && !isAutopilotLateGateSource(ctx, 'ultraqa')) return null;
   const phase = sanitizeDynamicText(ctx.ultraqa.current_phase || 'active') || 'active';
+  if (ctx.ultraqa.source === 'autopilot') {
+    return green(`autopilot:ultraqa`);
+  }
   return green(`qa:${phase}`);
 }
 
@@ -186,7 +198,10 @@ function renderUltragoal(ctx: HudRenderContext): string | null {
   if (!ctx.ultragoal?.active) return null;
   const total = ctx.ultragoal.progressTotal;
   const complete = ctx.ultragoal.complete;
-  if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(complete)) return null;
+  if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(complete)) {
+    const phase = sanitizeDynamicText(ctx.ultragoal.current_phase || ctx.ultragoal.status || 'active') || 'active';
+    return cyan(`ultragoal:${phase}`);
+  }
 
   const teamSummary = formatTeamSummary(ctx);
   const progress = cyan(`ultragoal ${complete}/${total}${teamSummary ? ` + ${teamSummary}` : ''}`);
@@ -292,6 +307,7 @@ const MINIMAL_ELEMENTS: ElementRenderer[] = [
   renderCodeReview,
   renderUltraqa,
   renderExecutionSummary,
+  renderStaleAutopilot,
   renderTurns,
 ];
 
@@ -306,6 +322,7 @@ const FOCUSED_ELEMENTS: ElementRenderer[] = [
   renderCodeReview,
   renderUltraqa,
   renderExecutionSummary,
+  renderStaleAutopilot,
   renderTurns,
   renderTokens,
   renderQuota,
@@ -324,6 +341,7 @@ const FULL_ELEMENTS: ElementRenderer[] = [
   renderCodeReview,
   renderUltraqa,
   renderExecutionSummary,
+  renderStaleAutopilot,
   renderTurns,
   renderTokens,
   renderQuota,

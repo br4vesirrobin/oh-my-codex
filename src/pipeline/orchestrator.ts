@@ -129,7 +129,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
         pipeline_stage_index: i,
         pipeline_stage_results: { ...stageResults },
         handoff_artifacts: normalizeHandoffArtifactKeys(handoffArtifactsByStage),
-      } as Partial<PipelineModeStateExtension>, cwd);
+      } as Partial<PipelineModeStateExtension>, cwd, undefined, { trustedPipelineProgress: true });
 
       lastStageName = stage.name;
       previousResult = skippedResult;
@@ -141,7 +141,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
       current_phase: stage.name,
       pipeline_stage_index: i,
       iteration: i + 1,
-    } as Partial<PipelineModeStateExtension>, cwd);
+    } as Partial<PipelineModeStateExtension>, cwd, undefined, { trustedPipelineProgress: true });
 
     // Execute the stage
     let result: StageResult;
@@ -190,6 +190,8 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
 
     if (shouldReturnToRalplan) {
       reviewCycle += 1;
+      artifacts.current_phase = 'ralplan';
+      artifacts.review_cycle = reviewCycle;
     }
 
     const handoffArtifacts = normalizeHandoffArtifactKeys(handoffArtifactsByStage);
@@ -210,7 +212,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
       } : {}),
       pipeline_stage_index: shouldReturnToRalplan ? findStageIndex(config.stages, 'ralplan') : i,
       pipeline_stage_results: { ...stageResults },
-    } as Partial<PipelineModeStateExtension>, cwd);
+    } as Partial<PipelineModeStateExtension>, cwd, undefined, { trustedPipelineProgress: true });
 
     // Bail on failure
     if (result.status === 'failed') {
@@ -277,7 +279,12 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
     active: false,
     current_phase: 'complete',
     completed_at: new Date().toISOString(),
-  }, cwd);
+    review_verdict: artifacts.review_verdict ?? null,
+    qa_verdict: artifacts.qa_verdict ?? null,
+    return_to_ralplan_reason: null,
+    handoff_artifacts: normalizeHandoffArtifactKeys(handoffArtifactsByStage),
+    pipeline_stage_results: { ...stageResults },
+  } as Partial<PipelineModeStateExtension>, cwd, undefined, { trustedPipelineProgress: true });
 
   return {
     status: 'completed',

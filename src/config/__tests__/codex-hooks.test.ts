@@ -11,6 +11,8 @@ import {
   buildManagedCodexHookTrustState,
   buildManagedCodexHookTrustToml,
   buildManagedCodexHooksConfig,
+  extractCodexHooksJsonTrustState,
+  hasCodexHooksJsonTopLevelState,
   discoverCodexHookConfigPaths,
   dedupeCodexHookConfigPaths,
   getMissingManagedCodexHookEvents,
@@ -18,6 +20,7 @@ import {
   isRuntimeCodexHomeMirrorPath,
   mergeManagedCodexHooksConfig,
   removeManagedCodexHooks,
+  resolveWindowsPowerShellPath,
 } from "../codex-hooks.js";
 
 describe("codex hooks helpers", () => {
@@ -49,10 +52,14 @@ describe("codex hooks helpers", () => {
     );
   });
 
-  it("uses a PowerShell ProcessStartInfo shim for Windows managed hook commands", () => {
+  it("uses a PowerShell -Command-safe Windows shim command with single-quoted literals", () => {
     const config = buildManagedCodexHooksConfig(
       "D:\\Program Files\\nvm\\v24.12.0\\node_modules\\oh-my-codex",
-      { platform: "win32", codexHomeDir: "C:\\Users\\Ada Lovelace\\.codex" },
+      {
+        platform: "win32",
+        codexHomeDir: "C:\\Users\\Ada Lovelace\\.codex",
+        env: { SystemRoot: "C:\\Windows" },
+      },
     );
     const command = (config.hooks.SessionStart[0] as {
       hooks?: Array<{ command?: string }>;
@@ -60,9 +67,59 @@ describe("codex hooks helpers", () => {
 
     assert.equal(
       command,
-      'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\\Users\\Ada Lovelace\\.codex\\hooks\\omx-native-hook-windows-shim.ps1"',
+      "& 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -NoProfile -ExecutionPolicy Bypass -File 'C:\\Users\\Ada Lovelace\\.codex\\hooks\\omx-native-hook-windows-shim.ps1'",
     );
     assert.doesNotMatch(command ?? "", /codex-native-hook\.js/);
+    assert.doesNotMatch(command ?? "", /^"[A-Z]:\\/i);
+    assert.doesNotMatch(command ?? "", /\\"/);
+  });
+
+  it("emits Windows hooks.json entries with only the cmd-compatible command field", () => {
+    const config = buildManagedCodexHooksConfig(
+      "D:\\Program Files\\nvm\\v24.12.0\\node_modules\\oh-my-codex",
+      {
+        platform: "win32",
+        codexHomeDir: "C:\\Users\\Ada Lovelace\\.codex",
+        env: { SystemRoot: "C:\\Windows" },
+      },
+    );
+    const serialized = JSON.parse(JSON.stringify(config)) as {
+      hooks?: Record<string, Array<{ hooks?: Array<Record<string, unknown>> }>>;
+      state?: unknown;
+    };
+    const commandHook = serialized.hooks?.SessionStart?.[0]?.hooks?.[0];
+
+    assert.equal(serialized.state, undefined);
+    assert.equal(commandHook?.type, "command");
+    assert.equal(commandHook?.commandWindows, undefined);
+    assert.equal(commandHook?.command_windows, undefined);
+    assert.equal(
+      commandHook?.command,
+      "& 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -NoProfile -ExecutionPolicy Bypass -File 'C:\\Users\\Ada Lovelace\\.codex\\hooks\\omx-native-hook-windows-shim.ps1'",
+    );
+  });
+
+  it("derives the PowerShell path from windir when SystemRoot is absent", () => {
+    const command = buildManagedCodexNativeHookCommand(
+      "D:\\Program Files\\nvm\\v24.12.0\\node_modules\\oh-my-codex",
+      {
+        platform: "win32",
+        codexHomeDir: "C:\\Users\\Ada Lovelace\\.codex",
+        env: { windir: "E:\\WINNT" },
+      },
+    );
+
+    assert.equal(
+      command,
+      "& 'E:\\WINNT\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -NoProfile -ExecutionPolicy Bypass -File 'C:\\Users\\Ada Lovelace\\.codex\\hooks\\omx-native-hook-windows-shim.ps1'",
+    );
+  });
+
+  it("falls back to the default Windows install root when no env hints exist", () => {
+    assert.equal(
+      resolveWindowsPowerShellPath({}),
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    );
   });
 
   it("keeps Windows shim paths quoted when they contain spaces", () => {
@@ -80,7 +137,11 @@ describe("codex hooks helpers", () => {
         }),
         "D:\\Program Files\\nvm\\v24.12.0\\node_modules\\oh-my-codex",
         "C:\\Users\\Ada Lovelace\\.codex\\hooks.json",
-        { platform: "win32", codexHomeDir: "C:\\Users\\Ada Lovelace\\.codex" },
+        {
+          platform: "win32",
+          codexHomeDir: "C:\\Users\\Ada Lovelace\\.codex",
+          env: { SystemRoot: "C:\\Windows" },
+        },
       ),
     ) as { hooks: Record<string, Array<{ hooks?: Array<{ command?: string }> }>> };
 
@@ -90,7 +151,7 @@ describe("codex hooks helpers", () => {
 
     assert.ok(commands.includes("echo keep-me"));
     assert.ok(commands.includes(
-      'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\\Users\\Ada Lovelace\\.codex\\hooks\\omx-native-hook-windows-shim.ps1"',
+      "& 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -NoProfile -ExecutionPolicy Bypass -File 'C:\\Users\\Ada Lovelace\\.codex\\hooks\\omx-native-hook-windows-shim.ps1'",
     ));
   });
 
@@ -122,6 +183,23 @@ describe("codex hooks helpers", () => {
       content,
       /\$startInfo\.Arguments = '"D:\\Program Files\\O''Malley\\oh-my-codex\\dist\\scripts\\codex-native-hook\.js"'/,
     );
+  });
+
+  it("prepends a UTF-8 BOM to the Windows shim so PowerShell 5.1 reads non-ASCII paths as UTF-8", () => {
+    const content = buildManagedCodexNativeHookWindowsShimContent(
+      "C:\\Users\\정찬\\깃헙\\oh-my-codex",
+      { nodePath: "C:\\Program Files\\nodejs\\node.exe" },
+    );
+
+    assert.equal(content.charCodeAt(0), 0xfeff);
+    assert.equal(content.codePointAt(0), 0xfeff);
+    // BOM must precede the script body, not replace it.
+    assert.equal(content.slice(1).startsWith("$ErrorActionPreference = 'Stop'"), true);
+    // Non-ASCII install path is preserved verbatim in the emitted shim.
+    assert.match(content, /정찬\\깃헙\\oh-my-codex/);
+
+    const utf8 = Buffer.from(content, "utf-8");
+    assert.deepEqual([...utf8.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
   });
 
   it("forwards payload, stdout, stderr, and non-zero exit through the Windows shim when PowerShell is available", async () => {
@@ -317,7 +395,7 @@ describe("codex hooks helpers", () => {
     assert.doesNotMatch(toml, /echo keep-me/);
   });
 
-  it("keeps hooks.json trust state outside the hook event map", () => {
+  it("keeps hooks.json trust state out of Codex-facing output", () => {
     const merged = JSON.parse(
       mergeManagedCodexHooksConfig(
         JSON.stringify({
@@ -345,31 +423,53 @@ describe("codex hooks helpers", () => {
         "/hooks.json",
       ),
     ) as {
-      state: Record<string, { trusted_hash?: string; enabled?: boolean }>;
+      state?: Record<string, { trusted_hash?: string; enabled?: boolean }>;
       hooks: Record<string, Array<{ hooks?: Array<{ command?: string }> }>>;
     };
 
+    assert.equal(Object.hasOwn(merged, "state"), false);
     assert.equal(Object.hasOwn(merged.hooks, "state"), false);
     assert.ok(
       Object.values(merged.hooks).every(Array.isArray),
-      "Codex Rust hook discovery expects hooks.hooks values to be event arrays",
-    );
-    assert.deepEqual(merged.state["custom:/hooks.json:stop:0:0"], {
-      trusted_hash: "sha256:user",
-      enabled: false,
-    });
-    assert.deepEqual(merged.state["custom:/hooks.json:prompt:0:0"], {
-      trusted_hash: "sha256:top-level-user",
-      enabled: true,
-    });
-    assert.match(
-      merged.state["/hooks.json:stop:0:0"]?.trusted_hash ?? "",
-      /^sha256:[a-f0-9]{64}$/,
+      "Codex Rust hook discovery expects all hooks values to be event arrays",
     );
     assert.match(JSON.stringify(merged.hooks.Stop), /echo user-stop/);
   });
 
-  it("preserves top-level managed hook state metadata while updating trusted_hash", () => {
+  it("extracts legacy hooks.json trust state for migration before merge", () => {
+    const content = JSON.stringify({
+      state: {
+        "custom:/hooks.json:prompt:0:0": {
+          trusted_hash: "sha256:top-level-user",
+          enabled: true,
+        },
+      },
+      hooks: {
+        state: {
+          "custom:/hooks.json:stop:0:0": {
+            trusted_hash: "sha256:user",
+            enabled: false,
+          },
+          malformed: { enabled: true },
+        },
+      },
+    });
+
+    assert.equal(hasCodexHooksJsonTopLevelState(content), true);
+    assert.deepEqual(extractCodexHooksJsonTrustState(content), {
+      "custom:/hooks.json:stop:0:0": {
+        trusted_hash: "sha256:user",
+        enabled: false,
+      },
+      "custom:/hooks.json:prompt:0:0": {
+        trusted_hash: "sha256:top-level-user",
+        enabled: true,
+      },
+    });
+  });
+
+
+  it("drops top-level managed hook state metadata from hooks.json", () => {
     const managedState = buildManagedCodexHookTrustState("/hooks.json", "/repo");
     const managedKey = Object.keys(managedState).find((key) =>
       key.includes(":stop:"),
@@ -390,18 +490,16 @@ describe("codex hooks helpers", () => {
         "/hooks.json",
       ),
     ) as {
-      state: Record<string, { trusted_hash?: string; enabled?: boolean }>;
+      state?: Record<string, { trusted_hash?: string; enabled?: boolean }>;
       hooks: Record<string, unknown>;
     };
 
+    assert.equal(Object.hasOwn(merged, "state"), false);
     assert.equal(Object.hasOwn(merged.hooks, "state"), false);
-    assert.deepEqual(merged.state[managedKey], {
-      trusted_hash: managedState[managedKey]?.trusted_hash,
-      enabled: false,
-    });
   });
 
-  it("migrates misplaced managed hook state metadata while updating trusted_hash", () => {
+
+  it("drops misplaced managed hook state metadata from hooks.json", () => {
     const managedState = buildManagedCodexHookTrustState("/hooks.json", "/repo");
     const managedKey = Object.keys(managedState).find((key) =>
       key.includes(":stop:"),
@@ -424,16 +522,14 @@ describe("codex hooks helpers", () => {
         "/hooks.json",
       ),
     ) as {
-      state: Record<string, { trusted_hash?: string; enabled?: boolean }>;
+      state?: Record<string, { trusted_hash?: string; enabled?: boolean }>;
       hooks: Record<string, unknown>;
     };
 
+    assert.equal(Object.hasOwn(merged, "state"), false);
     assert.equal(Object.hasOwn(merged.hooks, "state"), false);
-    assert.deepEqual(merged.state[managedKey], {
-      trusted_hash: managedState[managedKey]?.trusted_hash,
-      enabled: false,
-    });
   });
+
 
   it("keeps managed hook merge idempotent", () => {
     const first = mergeManagedCodexHooksConfig(null, "/repo", "/hooks.json");
@@ -538,10 +634,8 @@ describe("codex hooks helpers", () => {
       state?: Record<string, { trusted_hash?: string }>;
       hooks?: Record<string, unknown>;
     };
+    assert.equal(Object.hasOwn(cleaned, "state"), false);
     assert.equal(Object.hasOwn(cleaned.hooks ?? {}, "state"), false);
-    assert.deepEqual(cleaned.state?.["custom:/hooks.json:session_start:0:0"], {
-      trusted_hash: "sha256:user",
-    });
   });
 
   it("detects user hooks that remain after managed wrapper removal", () => {

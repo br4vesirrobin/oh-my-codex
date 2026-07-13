@@ -16,6 +16,7 @@ import { createUltraqaStage, buildUltraqaInstruction } from '../stages/ultraqa.j
 import { buildFollowupStaffingPlan } from '../../team/followup-planner.js';
 import { packageRoot } from '../../utils/paths.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
+import { LEADER_CONDUCTOR_BLOCK, buildUnsupportedNativeSubagentGuidance } from '../../leader/contract.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -656,6 +657,124 @@ describe('RALPLAN Stage', () => {
         review_verdict: { recommendation: 'REQUEST CHANGES', architectural_status: 'CLEAR', clean: false },
       },
     })), false);
+  });
+
+  it('run rejects stale nested ralplan artifacts when parent return-to-ralplan context is present', async () => {
+    const plansDir = join(tempDir, '.omx', 'plans');
+    await mkdir(plansDir, { recursive: true });
+    await writeFile(join(plansDir, 'prd-my-feature.md'), '# Plan\n');
+    await writeFile(join(plansDir, 'test-spec-my-feature.md'), '# Test Spec\n');
+
+    const stage = createRalplanStage();
+    const result = await stage.run(makeCtx({
+      artifacts: {
+        return_to_ralplan_reason: 'Code review requested a plan update.',
+        review_cycle: 1,
+        ralplan: {
+          ralplanConsensusGate: {
+            complete: true,
+            sequence: ['architect-review', 'critic-review'],
+            ralplan_architect_review: {
+              agent_role: 'architect',
+              verdict: 'approve',
+              completed_at: '2026-06-12T09:00:00.000Z',
+            },
+            ralplan_critic_review: {
+              agent_role: 'critic',
+              verdict: 'approve',
+              completed_at: '2026-06-12T09:05:00.000Z',
+            },
+          },
+        },
+      },
+    }));
+    const artifacts = result.artifacts as Record<string, unknown>;
+    const gate = artifacts.ralplanConsensusGate as { complete?: boolean; blockedReason?: string | null };
+
+    assert.equal(result.status, 'failed');
+    assert.equal(result.error, 'ralplan_consensus_evidence_missing');
+    assert.equal(gate.complete, false);
+    assert.equal(gate.blockedReason, 'missing_sequential_architect_then_critic_approval');
+  });
+
+  it('run accepts nested ralplan artifacts when review_cycle explicitly advances past parent loopback', async () => {
+    const plansDir = join(tempDir, '.omx', 'plans');
+    await mkdir(plansDir, { recursive: true });
+    await writeFile(join(plansDir, 'prd-my-feature.md'), '# Plan\n');
+    await writeFile(join(plansDir, 'test-spec-my-feature.md'), '# Test Spec\n');
+
+    const stage = createRalplanStage();
+    const result = await stage.run(makeCtx({
+      artifacts: {
+        return_to_ralplan_reason: 'Code review requested a plan update.',
+        review_cycle: 1,
+        ralplan: {
+          review_cycle: 2,
+          ralplanConsensusGate: {
+            complete: true,
+            sequence: ['architect-review', 'critic-review'],
+            ralplan_architect_review: {
+              agent_role: 'architect',
+              verdict: 'approve',
+              review_cycle: 2,
+              completed_at: '2026-06-12T10:00:00.000Z',
+            },
+            ralplan_critic_review: {
+              agent_role: 'critic',
+              verdict: 'approve',
+              review_cycle: 2,
+              completed_at: '2026-06-12T10:05:00.000Z',
+            },
+          },
+        },
+      },
+    }));
+    const artifacts = result.artifacts as Record<string, unknown>;
+    const gate = artifacts.ralplanConsensusGate as { complete?: boolean; blockedReason?: string | null };
+
+    assert.equal(result.status, 'completed');
+    assert.equal(result.error, undefined);
+    assert.equal(gate.complete, true);
+    assert.equal(gate.blockedReason, null);
+  });
+
+  it('run rejects nested ralplan artifacts when only the container review_cycle advances', async () => {
+    const plansDir = join(tempDir, '.omx', 'plans');
+    await mkdir(plansDir, { recursive: true });
+    await writeFile(join(plansDir, 'prd-my-feature.md'), '# Plan\n');
+    await writeFile(join(plansDir, 'test-spec-my-feature.md'), '# Test Spec\n');
+
+    const stage = createRalplanStage();
+    const result = await stage.run(makeCtx({
+      artifacts: {
+        return_to_ralplan_reason: 'Code review requested a plan update.',
+        review_cycle: 1,
+        ralplan: {
+          review_cycle: 2,
+          ralplanConsensusGate: {
+            complete: true,
+            sequence: ['architect-review', 'critic-review'],
+            ralplan_architect_review: {
+              agent_role: 'architect',
+              verdict: 'approve',
+              completed_at: '2026-06-12T10:00:00.000Z',
+            },
+            ralplan_critic_review: {
+              agent_role: 'critic',
+              verdict: 'approve',
+              completed_at: '2026-06-12T10:05:00.000Z',
+            },
+          },
+        },
+      },
+    }));
+    const artifacts = result.artifacts as Record<string, unknown>;
+    const gate = artifacts.ralplanConsensusGate as { complete?: boolean; blockedReason?: string | null };
+
+    assert.equal(result.status, 'failed');
+    assert.equal(result.error, 'ralplan_consensus_evidence_missing');
+    assert.equal(gate.complete, false);
+    assert.equal(gate.blockedReason, 'missing_sequential_architect_then_critic_approval');
   });
 
   it('canSkip returns false when nested code-review artifacts are non-clean', async () => {
@@ -1818,6 +1937,36 @@ describe('Default Autopilot Ultragoal Stage Adapters', () => {
     assert.deepEqual(descriptor.ralplanArtifacts, { plan: 'approved' });
     assert.match(artifacts.team_condition as string, /Launch \$team only inside an active Ultragoal story/);
     assert.match(buildUltragoalInstruction('execute me'), /^\$ultragoal /);
+    assert.match(buildUltragoalInstruction('execute me'), new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
+    assert.doesNotMatch(buildUltragoalInstruction('execute me'), /Native subagent support is unavailable/);
+    assert.match(buildUltragoalInstruction('execute me', {
+      nativeSubagentSupport: { status: 'unknown', source: 'default_unknown' },
+    }), new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
+    assert.match(buildUltragoalInstruction('execute me', {
+      nativeSubagentSupport: { status: 'supported', source: 'hook_payload_capability' },
+    }), new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
+  });
+
+  it('emits unsupported native subagent guidance for explicit unsupported ultragoal evidence', async () => {
+    const nativeSubagentSupport = {
+      status: 'unsupported' as const,
+      reason: 'multi_agent_v1_unavailable' as const,
+      source: 'hook_payload_capability' as const,
+      evidenceSummary: 'multi_agent_v1 is absent',
+    };
+    const instruction = buildUltragoalInstruction('execute me', { nativeSubagentSupport });
+    assert.doesNotMatch(instruction, /Conductor mode contract:/);
+    assert.match(instruction, new RegExp(escapeRegExp(buildUnsupportedNativeSubagentGuidance(nativeSubagentSupport))));
+
+    const stage = createUltragoalStage();
+    const result = await stage.run(makeCtx({ artifacts: { ralplan: { native_subagent_support: nativeSubagentSupport } } }));
+    const artifacts = result.artifacts as Record<string, unknown>;
+    assert.doesNotMatch(artifacts.instruction as string, /Conductor mode contract:/);
+    assert.match(artifacts.instruction as string, /multi_agent_v1_unavailable/);
+
+    const forged = await stage.run(makeCtx({ artifacts: { ralplan: { native_subagent_support: { status: 'unsupported', reason: 'multi_agent_v1_unavailable' } } } }));
+    const forgedArtifacts = forged.artifacts as Record<string, unknown>;
+    assert.match(forgedArtifacts.instruction as string, /Conductor mode contract:/);
   });
 
   it('creates an ultraqa gate that fails closed without evidence and can record clean skips', async () => {

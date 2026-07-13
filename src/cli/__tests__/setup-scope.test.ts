@@ -228,9 +228,10 @@ describe("omx setup scope behavior", () => {
       assert.equal(existsSync(agentsMdPath), true);
 
       const configToml = await readFile(localConfig, "utf-8");
-      assert.match(configToml, /^\[agents\]$/m);
-      assert.match(configToml, /^max_threads = 6$/m);
-      assert.match(configToml, /^max_depth = 2$/m);
+      assert.doesNotMatch(configToml, /^\[agents\]$/m);
+      assert.doesNotMatch(configToml, /^multi_agent\s*=/m);
+      assert.doesNotMatch(configToml, /^max_threads\s*=/m);
+      assert.doesNotMatch(configToml, /^max_depth\s*=/m);
       assert.doesNotMatch(configToml, /^\[env\]$/m);
       assert.match(configToml, /^\[shell_environment_policy\.set\]$/m);
       assert.match(configToml, /^USE_OMX_EXPLORE_CMD = "0"$/m);
@@ -302,6 +303,17 @@ describe("omx setup scope behavior", () => {
       await writeFile(
         join(codexDir, "config.toml"),
         [
+          "[features]",
+          "multi_agent = false",
+          "custom_feature = true",
+          "",
+          "[agents]",
+          "max_threads = 17",
+          "max_depth = 5",
+          "",
+          "[agents.custom_role]",
+          'description = "keep me"',
+          "",
           "[hooks.state.\"custom:/hooks.json:stop:0:0\"]",
           "trusted_hash = \"sha256:user\"",
           "enabled = false",
@@ -350,6 +362,75 @@ describe("omx setup scope behavior", () => {
         configToml,
         /^\[hooks\.state\.".*\/\.codex\/hooks\.json:stop:0:0"\]$/m,
       );
+      assert.match(configToml, /^multi_agent = false$/m);
+      assert.match(configToml, /^custom_feature = true$/m);
+      assert.match(configToml, /^\[agents\]$/m);
+      assert.match(configToml, /^max_threads = 17$/m);
+      assert.match(configToml, /^max_depth = 5$/m);
+      assert.match(configToml, /^\[agents\.custom_role\]$/m);
+      assert.match(configToml, /^description = "keep me"$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates legacy hooks.json state to config.toml and removes Codex-incompatible top-level state", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-hooks-state-migration-"));
+    try {
+      const home = join(wd, "home");
+      const codexDir = join(wd, ".codex");
+      await mkdir(home, { recursive: true });
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(
+        join(codexDir, "hooks.json"),
+        JSON.stringify(
+          {
+            state: {
+              "custom:/hooks.json:stop:0:0": {
+                trusted_hash: "sha256:user",
+                enabled: false,
+              },
+            },
+            hooks: {
+              Stop: [
+                {
+                  hooks: [
+                    {
+                      type: "command",
+                      command: 'node "/old/dist/scripts/codex-native-hook.js"',
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      await writeFile(join(codexDir, "config.toml"), "omx_enabled = true\n");
+
+      const res = runOmx(wd, ["setup", "--scope", "project"], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+
+      const hooksJson = JSON.parse(
+        await readFile(join(codexDir, "hooks.json"), "utf-8"),
+      ) as {
+        state?: unknown;
+        hooks?: Record<string, unknown>;
+      };
+      assert.equal(Object.hasOwn(hooksJson, "state"), false);
+      assert.equal(Object.hasOwn(hooksJson.hooks ?? {}, "state"), false);
+      assert.ok(hooksJson.hooks?.Stop, "managed setup should preserve Stop coverage");
+
+      const configToml = await readFile(join(codexDir, "config.toml"), "utf-8");
+      assert.match(
+        configToml,
+        /^\[hooks\.state\."custom:\/hooks\.json:stop:0:0"\]$/m,
+      );
+      assert.match(configToml, /^trusted_hash = "sha256:user"$/m);
+      assert.match(configToml, /^enabled = false$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -386,6 +467,11 @@ describe("omx setup scope behavior", () => {
         "utf-8",
       );
       assert.match(agentsMd, /~\/\.codex\/skills/);
+      const userConfigToml = await readFile(join(home, ".codex", "config.toml"), "utf-8");
+      assert.doesNotMatch(userConfigToml, /^multi_agent\s*=/m);
+      assert.doesNotMatch(userConfigToml, /^\[agents\]$/m);
+      assert.doesNotMatch(userConfigToml, /^max_threads\s*=/m);
+      assert.doesNotMatch(userConfigToml, /^max_depth\s*=/m);
       assert.equal(
         await readFile(join(wd, "AGENTS.md"), "utf-8"),
         existingAgents,

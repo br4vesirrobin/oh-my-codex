@@ -20,6 +20,11 @@ export interface UltragoalActiveGoalForHud {
 
 export interface UltragoalStateForHud {
   active: boolean;
+  current_phase?: string;
+  mode?: string;
+  started_at?: string;
+  updated_at?: string;
+  session_id?: string;
   status?: string;
   total: number;
   complete: number;
@@ -44,6 +49,11 @@ export interface UltraworkStateForHud {
 export interface AutopilotStateForHud {
   active: boolean;
   current_phase?: string;
+  mode?: string;
+  session_id?: string;
+  tmux_pane_id?: string;
+  source?: 'authoritative' | 'current-autopilot-stale';
+  stale_reason?: string;
 }
 
 /** Ralplan state for HUD display */
@@ -67,7 +77,7 @@ export interface AutoresearchStateForHud {
   current_phase?: string;
 }
 
-export type LateGateHudSource = 'canonical-skill' | 'autopilot';
+export type LateGateHudSource = 'canonical-skill' | 'autopilot' | 'subagent-tracking';
 
 /** Code-review state for HUD display */
 export interface CodeReviewStateForHud {
@@ -135,6 +145,7 @@ export interface HudRenderContext {
   metrics: HudMetrics | null;
   hudNotify: HudNotifyState | null;
   session: SessionStateForHud | null;
+  staleAutopilot?: AutopilotStateForHud | null;
   /** Rust-authored runtime snapshot (present when bridge is enabled and snapshot.json exists). */
   runtimeSnapshot?: import('../runtime/bridge.js').RuntimeSnapshot | null;
 }

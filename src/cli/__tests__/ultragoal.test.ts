@@ -31,6 +31,12 @@ function cleanQualityGate(): string {
         architect: { agentRole: 'architect', evidence: 'architect subagent returned CLEAR' },
       },
     },
+    architectureInvariantGate: {
+      status: 'passed',
+      sourceArtifacts: ['.omx/ultragoal/brief.md', '.omx/ultragoal/goals.json'],
+      invariants: [],
+      evidence: 'architect verified no additional architecture invariants were declared in the brief',
+    },
   });
 }
 
@@ -180,6 +186,42 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  it('prints explicit terminal cleanup after final checkpoint without claiming hidden clear', async () => {
+    await withCwd(async (cwd) => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- Final milestone']));
+      await capture(() => ultragoalCommand(['complete-goals']));
+      const goals = JSON.parse(await readFile(join(cwd, '.omx/ultragoal/goals.json'), 'utf-8')) as { codexObjective: string };
+
+      const checkpoint = await capture(() => ultragoalCommand([
+        'checkpoint',
+        '--goal-id', 'G001-final-milestone',
+        '--status', 'complete',
+        '--evidence', 'tests and final review passed',
+        '--codex-goal-json', JSON.stringify({ goal: { objective: goals.codexObjective, status: 'complete' } }),
+        '--quality-gate-json', cleanQualityGate(),
+      ]));
+
+      const output = checkpoint.stdout.join('\n');
+      assert.equal(checkpoint.exitCode, undefined);
+      assert.match(output, /Terminal next step for another goal in this same Codex thread\/session: run \/goal clear/);
+      assert.match(output, /OMX shell commands and hooks do not call \/goal clear or hidden thread\/goal\/clear routes/);
+      assert.doesNotMatch(output, /cleared Codex goal state/i);
+    });
+  });
+
+  it('places completed-goal preflight remediation before create_goal guidance', async () => {
+    await withCwd(async () => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
+      const next = await capture(() => ultragoalCommand(['complete-goals']));
+      const output = next.stdout.join('\n');
+
+      assert.match(output, /get_goal reports status complete before create_goal/);
+      assert.match(output, /Run \/goal clear in the Codex UI before starting another goal/);
+      assert.ok(output.indexOf('get_goal reports status complete before create_goal') < output.indexOf('create_goal payload'));
+      assert.match(output, /OMX did not and cannot clear hidden Codex goal state/);
+    });
+  });
+
   it('reports artifact-backed completion when Codex goal DB schema is unavailable', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
@@ -248,7 +290,7 @@ describe('cli/ultragoal', () => {
       const status = await capture(() => ultragoalCommand(['status']));
       const output = status.stdout.join('\n');
       assert.match(output, /ultragoal aggregate product: complete/);
-      assert.match(output, /microgoal ledger bookkeeping \(progress-only\): 0\/2 complete, 1 pending, 1 in progress/);
+      assert.match(output, /microgoal ledger bookkeeping \(progress-only\): 1\/2 complete, 1 pending, 0 in progress/);
     });
   });
 
@@ -537,6 +579,31 @@ describe('cli/ultragoal', () => {
       assert.equal(unavailable.exitCode, 1);
       assert.match(unavailable.stderr.join('\n'), /DB\/schema\/context error/);
       assert.match(unavailable.stderr.join('\n'), /strict completion reconciliation can be proven/);
+    });
+  });
+
+  it('rejects null get_goal snapshots for completion without mutating OMX progress', async () => {
+    await withCwd(async (cwd) => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
+      await capture(() => ultragoalCommand(['complete-goals']));
+
+      const rejected = await capture(() => ultragoalCommand([
+        'checkpoint',
+        '--goal-id', 'G001-first-milestone',
+        '--status', 'complete',
+        '--evidence', 'tests passed',
+        '--codex-goal-json', '{"goal":null}',
+        '--json',
+      ]));
+
+      assert.equal(rejected.exitCode, 1);
+      assert.match(rejected.stderr.join('\n'), /no active goal\/null/);
+      assert.match(rejected.stderr.join('\n'), /call create_goal/);
+      assert.match(rejected.stderr.join('\n'), /do not mark complete from OMX state alone/);
+
+      const plan = JSON.parse(await readFile(join(cwd, '.omx/ultragoal/goals.json'), 'utf-8')) as { activeGoalId?: string; goals: Array<{ status: string }> };
+      assert.equal(plan.activeGoalId, 'G001-first-milestone');
+      assert.equal(plan.goals[0].status, 'in_progress');
     });
   });
 
